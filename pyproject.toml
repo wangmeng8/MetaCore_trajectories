@@ -1,0 +1,9 @@
+[project]
+name = "tau2-gpt55-trajectories"
+version = "0.1.0"
+description = "Minimal Tau2-bench GPT-5.5 trajectory runner and collector."
+requires-python = ">=3.10"
+dependencies = []
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
