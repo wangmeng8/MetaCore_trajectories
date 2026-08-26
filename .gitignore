@@ -16,3 +16,4 @@ data/modelscope/
 data/retry/
 *.parquet
 *.tar.gz
+tau2_gpt55_trajectories.egg-info/
