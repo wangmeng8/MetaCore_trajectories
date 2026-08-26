@@ -201,11 +201,61 @@ def build_tau2_command(
     return command, ignored
 
 
+def run_multiple_domains(args: argparse.Namespace, argv: list[str] | None) -> int:
+    domains = []
+    for value in args.domains or []:
+        domains.extend(part.strip() for part in value.split(",") if part.strip())
+    domains = list(dict.fromkeys(domains))
+    if not domains:
+        raise ValueError("--domains requires at least one domain")
+
+    base_argv = _strip_multi_domain_args(list(sys.argv[1:] if argv is None else argv))
+    base_run_id = (
+        args.run_id
+        or os.environ.get("TAU2_RUN_ID")
+        or f"{datetime.now().strftime('%Y-%m-%d_%H%M%S')}_{_safe_run_part(args.agent_model or os.environ.get('AGENT_MODEL', 'gpt-5.5'))}"
+    )
+    return_codes: list[int] = []
+
+    for domain in domains:
+        domain_run_id = f"{base_run_id}_{_safe_run_part(domain)}"
+        domain_argv = [*base_argv, "--domain", domain, "--run-id", domain_run_id]
+        print(f"\n===== Tau2 domain {domain} ({len(return_codes) + 1}/{len(domains)}) =====")
+        return_codes.append(main(domain_argv))
+
+    return next((code for code in return_codes if code != 0), 0)
+
+
+def _strip_multi_domain_args(argv: list[str]) -> list[str]:
+    stripped: list[str] = []
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        if token == "--domains":
+            index += 1
+            while index < len(argv) and not argv[index].startswith("--"):
+                index += 1
+            continue
+        if token.startswith("--domains="):
+            index += 1
+            continue
+        if token == "--run-id":
+            index += 2
+            continue
+        if token.startswith("--run-id="):
+            index += 1
+            continue
+        stripped.append(token)
+        index += 1
+    return stripped
+
+
 def main(argv: list[str] | None = None) -> int:
     load_dotenv_file(Path(".env"))
     parser = argparse.ArgumentParser(description="Run Tau2-bench with GPT-5.5 and collect trajectories.")
     parser.add_argument("--dry-run", action="store_true", help="Print command and create a dry-run manifest without running Tau2.")
     parser.add_argument("--domain", help="Override TAU2_DOMAIN.")
+    parser.add_argument("--domains", nargs="+", help="Run multiple domains sequentially, e.g. airline retail telecom.")
     parser.add_argument("--benchmark", help="Override BENCHMARK.")
     parser.add_argument("--agent-model", help="Override AGENT_MODEL.")
     parser.add_argument("--user-model", help="Override USER_MODEL.")
@@ -216,7 +266,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--task-ids", nargs="+", help="Run specific Tau2 task IDs.")
     parser.add_argument("--task-set-name", help="Override Tau2 --task-set-name.")
     parser.add_argument("--task-split-name", help="Override Tau2 --task-split-name.")
-    parser.add_argument("--num-trials", type=int, help="Override NUM_TRIALS.")
+    parser.add_argument("--num-trials", "--num-rollouts", dest="num_trials", type=int, help="Rollouts per task; passed to Tau2 as --num-trials.")
     parser.add_argument("--output-dir", type=Path, help="Override OUTPUT_DIR.")
     parser.add_argument("--reasoning-effort", help="Override REASONING_EFFORT.")
     parser.add_argument("--temperature", help="Override TEMPERATURE.")
@@ -233,6 +283,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--tau2-repo-dir", type=Path, help="Override TAU2_REPO_DIR for running tau2 from a checkout.")
     parser.add_argument("--tau2-use-uv", action="store_true", help='Run Tau2 as "uv run tau2" from TAU2_REPO_DIR.')
     args = parser.parse_args(argv)
+
+    if args.domains:
+        if args.domain:
+            parser.error("use either --domain or --domains, not both")
+        return run_multiple_domains(args, argv)
 
     env = prepare_tau2_env(os.environ)
     _apply_cli_overrides(env, args)
@@ -784,6 +839,10 @@ def prepare_tau2_env(base_env: dict[str, str] | os._Environ[str]) -> dict[str, s
     env.setdefault("PYTHONUTF8", "1")
     env.setdefault("PYTHONIOENCODING", "utf-8")
     env.setdefault("PYTHONLEGACYWINDOWSSTDIO", "0")
+    # Tau2 uses LiteLLM, whose OpenAI-compatible endpoint variable is
+    # OPENAI_API_BASE; keep the OpenAI SDK variable working as well.
+    if env.get("OPENAI_BASE_URL") and not env.get("OPENAI_API_BASE"):
+        env["OPENAI_API_BASE"] = env["OPENAI_BASE_URL"]
     return env
 
 

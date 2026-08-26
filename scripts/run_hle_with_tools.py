@@ -51,6 +51,7 @@ class HLEWithToolsConfig:
     model: str
     base_url: str | None
     num_tasks: int | None
+    num_rollouts: int
     max_workers: int
     max_retries: int
     process_retries: int
@@ -113,6 +114,7 @@ def build_hle_with_tools_config(env: dict[str, str] | None = None, now: str | No
         model=model,
         base_url=normalize_base_url(env.get("OPENAI_BASE_URL") or env.get("HLE_OPENAI_BASE_URL")),
         num_tasks=num_tasks,
+        num_rollouts=max(1, env_int(env, "HLE_NUM_ROLLOUTS", 1)),
         max_workers=max(2, env_int(env, "HLE_MAX_WORKERS", 2)),
         max_retries=max(0, env_int(env, "HLE_MAX_RETRIES", env_int(env, "OPENAI_MAX_RETRIES", 2))),
         process_retries=max(0, env_int(env, "HLE_PROCESS_RETRIES", 0)),
@@ -147,6 +149,8 @@ def build_official_command(config: HLEWithToolsConfig) -> list[str]:
             str(config.max_iterations),
         ]
     )
+    if config.num_rollouts > 1:
+        command.extend(["--num_rollouts", str(config.num_rollouts)])
     if config.num_tasks is not None:
         command.extend(["--max_samples", str(config.num_tasks)])
     if config.temperature is not None:
@@ -184,7 +188,7 @@ def run_official_command(
     stderr_path = config.run_dir / "hle_with_tools.stderr.log"
     progress = ProgressPrinter(
         label="HLE-with-tools",
-        total=config.num_tasks,
+        total=config.num_tasks * config.num_rollouts if config.num_tasks is not None else None,
         interval_seconds=config.progress_interval,
     )
 
@@ -260,6 +264,7 @@ def collect_hle_with_tools_outputs(config: HLEWithToolsConfig) -> tuple[list[dic
             "process_retries": config.process_retries,
             "max_completion_tokens": config.max_completion_tokens,
             "max_iterations": config.max_iterations,
+            "rollouts_per_task": config.num_rollouts,
             "total_prompt_tokens": usage_totals.get("prompt_tokens", 0),
             "total_completion_tokens": usage_totals.get("completion_tokens", 0),
             "total_tokens": usage_totals.get("total_tokens", 0),
@@ -299,7 +304,7 @@ def normalize_official_record(
         "run_id": config.run_id,
         "domain": config.dataset_arg,
         "task_id": task_id,
-        "trial_id": 0,
+        "trial_id": rollout_index_for_task(task_id),
         "agent_model": prediction.get("model") or config.model,
         "user_model": None,
         "success": None,
@@ -475,6 +480,11 @@ def safe_official_id(value: str) -> str:
     return value.replace("/", "_").replace("\\", "_").replace(":", "_")
 
 
+def rollout_index_for_task(task_id: str) -> int:
+    match = re.search(r"__rollout_(\d+)$", str(task_id))
+    return int(match.group(1)) if match else 0
+
+
 def optional_float(value: str | None) -> float | None:
     if value is None or value == "":
         return None
@@ -511,6 +521,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--model", help="Model name passed to the official runner.")
     parser.add_argument("--base-url", help="OpenAI-compatible base URL. Bare hosts get /v1 appended.")
     parser.add_argument("--num-tasks", type=int, help="Number of text-only HLE examples to run.")
+    parser.add_argument("--num-rollouts", type=int, help="Independent model rollouts per dataset example (default: 1).")
     parser.add_argument("--all-tasks", action="store_true", help="Run all selected examples.")
     parser.add_argument("--max-workers", type=int, help="Official async worker count. Minimum is 2.")
     parser.add_argument("--max-retries", type=int, help="OpenAI client retry count for API calls.")
@@ -536,6 +547,7 @@ def apply_cli_overrides(env: dict[str, str], args: argparse.Namespace) -> dict[s
         "HLE_MODEL": args.model,
         "OPENAI_BASE_URL": normalize_base_url(args.base_url),
         "NUM_TASKS": args.num_tasks,
+        "HLE_NUM_ROLLOUTS": args.num_rollouts,
         "HLE_MAX_WORKERS": args.max_workers,
         "HLE_MAX_RETRIES": args.max_retries,
         "HLE_PROCESS_RETRIES": args.process_retries,

@@ -90,11 +90,27 @@ Usage: tau2 run [OPTIONS]
         self.assertNotIn("NUM_TASKS", ignored)
 
     def test_prepares_utf8_environment_for_tau2_subprocess(self):
-        env = prepare_tau2_env({"OPENAI_API_KEY": "test-key"})
+        env = prepare_tau2_env(
+            {
+                "OPENAI_API_KEY": "test-key",
+                "OPENAI_BASE_URL": "https://proxy.example/v1",
+            }
+        )
 
         self.assertEqual(env["PYTHONUTF8"], "1")
         self.assertEqual(env["PYTHONIOENCODING"], "utf-8")
         self.assertEqual(env["PYTHONLEGACYWINDOWSSTDIO"], "0")
+        self.assertEqual(env["OPENAI_API_BASE"], "https://proxy.example/v1")
+
+    def test_preserves_explicit_litellm_api_base(self):
+        env = prepare_tau2_env(
+            {
+                "OPENAI_BASE_URL": "https://sdk.example/v1",
+                "OPENAI_API_BASE": "https://litellm.example/v1",
+            }
+        )
+
+        self.assertEqual(env["OPENAI_API_BASE"], "https://litellm.example/v1")
 
     def test_forwards_separate_agent_and_user_llm_args_without_exposing_keys(self):
         env = {

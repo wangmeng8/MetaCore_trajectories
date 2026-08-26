@@ -79,6 +79,7 @@ class RunHLEWithToolsOfficialTests(unittest.TestCase):
                 model="gpt-5.5",
                 base_url=None,
                 num_tasks=1,
+                num_rollouts=1,
                 max_workers=2,
                 max_retries=3,
                 process_retries=3,
