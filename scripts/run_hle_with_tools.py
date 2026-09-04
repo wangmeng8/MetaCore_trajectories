@@ -62,6 +62,10 @@ class HLEWithToolsConfig:
     disable_scientific_search: bool
     use_uv: bool
     progress_interval: float
+    question_timeout_seconds: float = 1800.0
+    skip_failed_on_resume: bool = False
+    mark_incorrect_ids: tuple[str, ...] = ()
+    system_prompt_file: Path | None = None
 
     @property
     def dataset_arg(self) -> str:
@@ -86,6 +90,10 @@ class HLEWithToolsConfig:
         return self.official_raw_dir / f"hle_{self.safe_model_id}.json.temp"
 
     @property
+    def progress_state_path(self) -> Path:
+        return self.official_raw_dir / "progress_state.json"
+
+    @property
     def tool_names(self) -> list[str]:
         if self.disable_scientific_search:
             return [name for name in TOOL_NAMES if name != "scientific_search"]
@@ -100,6 +108,7 @@ def build_hle_with_tools_config(env: dict[str, str] | None = None, now: str | No
     output_dir = Path(env.get("OUTPUT_DIR", "outputs/runs"))
     run_id = env.get("HLE_RUN_ID") or env.get("RUN_ID") or f"{timestamp}_{safe_run_part(model)}_{safe_run_part(benchmark)}"
     data_path = env.get("HLE_DATA_PATH")
+    system_prompt_file = env.get("HLE_SYSTEM_PROMPT_FILE")
     all_tasks = env_bool(env, "HLE_ALL_TASKS", False)
     num_tasks = None if all_tasks else env_int(env, "NUM_TASKS", env_int(env, "HLE_NUM_EXAMPLES", 1))
     temperature = optional_float(env.get("HLE_TEMPERATURE"))
@@ -125,6 +134,14 @@ def build_hle_with_tools_config(env: dict[str, str] | None = None, now: str | No
         disable_scientific_search=env_bool(env, "HLE_DISABLE_SCIENTIFIC_SEARCH", False),
         use_uv=env_bool(env, "HLE_WITH_TOOLS_USE_UV", True),
         progress_interval=float(env.get("HLE_PROGRESS_INTERVAL", "30")),
+        question_timeout_seconds=max(0.0, float(env.get("HLE_QUESTION_TIMEOUT_SECONDS", "1800"))),
+        skip_failed_on_resume=env_bool(env, "HLE_SKIP_FAILED_ON_RESUME", False),
+        mark_incorrect_ids=tuple(
+            value.strip()
+            for value in env.get("HLE_MARK_INCORRECT_IDS", "").split(",")
+            if value.strip()
+        ),
+        system_prompt_file=Path(system_prompt_file) if system_prompt_file else None,
     )
 
 
@@ -147,6 +164,8 @@ def build_official_command(config: HLEWithToolsConfig) -> list[str]:
             str(config.max_workers),
             "--max_iterations",
             str(config.max_iterations),
+            "--question_timeout_seconds",
+            str(config.question_timeout_seconds),
         ]
     )
     if config.num_rollouts > 1:
@@ -155,6 +174,12 @@ def build_official_command(config: HLEWithToolsConfig) -> list[str]:
         command.extend(["--max_samples", str(config.num_tasks)])
     if config.temperature is not None:
         command.extend(["--temperature", str(config.temperature)])
+    if config.skip_failed_on_resume:
+        command.append("--skip_failed_on_resume")
+    if config.mark_incorrect_ids:
+        command.extend(["--mark_incorrect_ids", ",".join(config.mark_incorrect_ids)])
+    if config.system_prompt_file:
+        command.extend(["--system_prompt_file", str(config.system_prompt_file.resolve())])
     return command
 
 
@@ -203,11 +228,14 @@ def run_official_command(
             encoding="utf-8",
             errors="replace",
         )
-        progress.update(current_prediction_count(config), extra=f"workers={config.max_workers}", force=True)
+        snapshot = current_progress_state(config)
+        progress.update(snapshot["completed"], extra=format_progress_extra(config, snapshot), force=True)
         while process.poll() is None:
             time.sleep(1)
-            progress.update(current_prediction_count(config), extra=f"workers={config.max_workers}")
-        progress.update(current_prediction_count(config), extra=f"workers={config.max_workers}", force=True)
+            snapshot = current_progress_state(config)
+            progress.update(snapshot["completed"], extra=format_progress_extra(config, snapshot))
+        snapshot = current_progress_state(config)
+        progress.update(snapshot["completed"], extra=format_progress_extra(config, snapshot), force=True)
         return int(process.returncode or 0)
 
 
@@ -264,6 +292,9 @@ def collect_hle_with_tools_outputs(config: HLEWithToolsConfig) -> tuple[list[dic
             "process_retries": config.process_retries,
             "max_completion_tokens": config.max_completion_tokens,
             "max_iterations": config.max_iterations,
+            "system_prompt_file": (
+                str(config.system_prompt_file.resolve()) if config.system_prompt_file else None
+            ),
             "rollouts_per_task": config.num_rollouts,
             "total_prompt_tokens": usage_totals.get("prompt_tokens", 0),
             "total_completion_tokens": usage_totals.get("completion_tokens", 0),
@@ -287,6 +318,8 @@ def normalize_official_record(
     code_file = config.official_raw_dir / "code" / f"{safe_official_id(task_id)}.py"
     code_text = read_text_or_empty(code_file)
     prediction = prediction or {}
+    error = prediction.get("error") if isinstance(prediction.get("error"), dict) else {}
+    is_infrastructure_error = prediction.get("termination_reason") == "infrastructure_error"
     final_response = prediction.get("response")
     question = extract_question_from_trace(trace_text)
     events = [{"index": 0, "role": "user", "type": "message", "content": question}]
@@ -307,8 +340,8 @@ def normalize_official_record(
         "trial_id": rollout_index_for_task(task_id),
         "agent_model": prediction.get("model") or config.model,
         "user_model": None,
-        "success": None,
-        "score": None,
+        "success": False if is_infrastructure_error else None,
+        "score": 0.0 if is_infrastructure_error else None,
         "num_turns": count_iterations(trace_text),
         "num_tool_calls": count_tool_calls(trace_text, prediction),
         "task": {"instruction": question},
@@ -318,7 +351,12 @@ def normalize_official_record(
             "trace_text": trace_text,
             "code": code_text,
             "official_files": raw_files,
-            "completed_prediction": bool(prediction),
+            "completed_prediction": bool(prediction) and not is_infrastructure_error,
+            "termination_reason": "infrastructure_error" if is_infrastructure_error else None,
+            "info": {
+                "error_type": error.get("error_type"),
+                "error_message": error.get("message"),
+            } if is_infrastructure_error else {},
         },
         "raw_file": raw_files["prediction_file"],
     }
@@ -329,8 +367,10 @@ def to_official_benchmark_record(normalized: dict[str, Any], *, config: HLEWithT
     source_model = str(normalized.get("agent_model") or config.model)
     raw = normalized.get("raw") if isinstance(normalized.get("raw"), dict) else {}
     prediction = raw.get("official_prediction") if isinstance(raw.get("official_prediction"), dict) else {}
+    is_infrastructure_error = raw.get("termination_reason") == "infrastructure_error"
     trace_text = raw.get("trace_text") if isinstance(raw.get("trace_text"), str) else ""
-    trajectory_text = trace_text or str(prediction.get("response") or "")
+    prediction_error = prediction.get("error") if isinstance(prediction.get("error"), dict) else {}
+    trajectory_text = trace_text or str(prediction.get("response") or prediction_error.get("message") or "")
     return {
         "task_id": task_id,
         "benchmark": config.benchmark,
@@ -353,7 +393,7 @@ def to_official_benchmark_record(normalized: dict[str, Any], *, config: HLEWithT
                     "num_turns": normalized.get("num_turns"),
                     "num_tool_calls": normalized.get("num_tool_calls"),
                     "usage": prediction.get("usage"),
-                    "completed_prediction": bool(prediction),
+                    "completed_prediction": bool(prediction) and not is_infrastructure_error,
                     "raw_file": normalized.get("raw_file"),
                     "trace_file": (raw.get("official_files") or {}).get("trace_file"),
                     "code_file": (raw.get("official_files") or {}).get("code_file"),
@@ -387,8 +427,38 @@ def load_predictions(config: HLEWithToolsConfig) -> tuple[dict[str, dict[str, An
 
 
 def current_prediction_count(config: HLEWithToolsConfig) -> int:
-    predictions, _ = load_predictions(config)
-    return len(predictions)
+    return current_progress_state(config)["completed"]
+
+
+def current_progress_state(config: HLEWithToolsConfig) -> dict[str, int]:
+    defaults = {
+        "completed": 0,
+        "running": 0,
+        "failed": 0,
+        "timed_out": 0,
+        "pending": 0,
+        "skipped": 0,
+        "total": 0,
+    }
+    try:
+        payload = json.loads(config.progress_state_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return defaults
+    if not isinstance(payload, dict):
+        return defaults
+    return {
+        key: value if isinstance((value := payload.get(key)), int) and value >= 0 else default
+        for key, default in defaults.items()
+    }
+
+
+def format_progress_extra(config: HLEWithToolsConfig, snapshot: dict[str, int]) -> str:
+    details = [f"workers={config.max_workers}"]
+    if snapshot["total"]:
+        details.append(f"total={snapshot['total']}")
+    for key in ("running", "failed", "timed_out", "skipped", "pending"):
+        details.append(f"{key}={snapshot[key]}")
+    return " ".join(details)
 
 
 def per_question_trace_files(trace_dir: Path) -> dict[str, Path]:
@@ -506,6 +576,7 @@ def config_for_manifest(config: HLEWithToolsConfig) -> dict[str, Any]:
     payload["run_dir"] = str(config.run_dir)
     payload["repo_dir"] = str(config.repo_dir)
     payload["data_path"] = str(config.data_path) if config.data_path else None
+    payload["system_prompt_file"] = str(config.system_prompt_file) if config.system_prompt_file else None
     payload["dataset_arg"] = config.dataset_arg
     payload["tools"] = config.tool_names
     return payload
@@ -534,6 +605,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--run-id", help="Fixed run id, useful for resume.")
     parser.add_argument("--output-dir", type=Path, help="Base output directory.")
     parser.add_argument("--progress-interval", type=float, help="Seconds between progress updates.")
+    parser.add_argument("--question-timeout-seconds", type=float, help="Hard wall-clock limit for one full question trajectory.")
+    parser.add_argument("--skip-failed-on-resume", action="store_true", help="Skip IDs already recorded as failed or timed out.")
+    parser.add_argument(
+        "--mark-incorrect-ids",
+        help="Comma-separated question IDs to record as incorrect without running them.",
+    )
+    parser.add_argument(
+        "--system-prompt-file",
+        type=Path,
+        help="UTF-8 text appended to the HLE system message before each question.",
+    )
     parser.add_argument("--no-uv", action="store_true", help="Use current Python instead of uv run.")
     return parser.parse_args(argv)
 
@@ -557,6 +639,9 @@ def apply_cli_overrides(env: dict[str, str], args: argparse.Namespace) -> dict[s
         "HLE_RUN_ID": args.run_id,
         "OUTPUT_DIR": str(args.output_dir) if args.output_dir else None,
         "HLE_PROGRESS_INTERVAL": args.progress_interval,
+        "HLE_QUESTION_TIMEOUT_SECONDS": args.question_timeout_seconds,
+        "HLE_MARK_INCORRECT_IDS": args.mark_incorrect_ids,
+        "HLE_SYSTEM_PROMPT_FILE": str(args.system_prompt_file) if args.system_prompt_file else None,
     }
     for key, value in updates.items():
         if value is not None:
@@ -566,6 +651,8 @@ def apply_cli_overrides(env: dict[str, str], args: argparse.Namespace) -> dict[s
     if args.include_multimodal:
         env["HLE_WITH_TOOLS_TEXT_ONLY"] = "0"
         env["HLE_INCLUDE_MULTIMODAL"] = "1"
+    if args.skip_failed_on_resume:
+        env["HLE_SKIP_FAILED_ON_RESUME"] = "1"
     if args.no_uv:
         env["HLE_WITH_TOOLS_USE_UV"] = "0"
     return env
@@ -581,6 +668,8 @@ def validate_real_run(config: HLEWithToolsConfig, env: dict[str, str]) -> str | 
         return "OPENAI_API_KEY or OPENROUTER_API_KEY is required for a real HLE with tools run"
     if config.data_path is not None and not config.data_path.exists():
         return f"HLE_DATA_PATH does not exist: {config.data_path}"
+    if config.system_prompt_file is not None and not config.system_prompt_file.is_file():
+        return f"HLE_SYSTEM_PROMPT_FILE does not exist or is not a file: {config.system_prompt_file}"
     return None
 
 
@@ -593,6 +682,8 @@ def main(argv: list[str] | None = None) -> int:
     official_env = prepare_official_env(config, env)
 
     config.run_dir.mkdir(parents=True, exist_ok=True)
+    if config.system_prompt_file and config.system_prompt_file.is_file():
+        shutil.copy2(config.system_prompt_file, config.run_dir / "system_prompt.txt")
     manifest = build_manifest(
         run_id=config.run_id,
         benchmark=config.benchmark,
