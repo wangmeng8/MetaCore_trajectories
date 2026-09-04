@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import re
+import signal
 import shutil
 import subprocess
 import sys
@@ -38,6 +39,7 @@ from scripts.runner_common import (
 
 BENCHMARK = "hle-with-tools"
 TOOL_NAMES = ["code_interpreter", "web_browsing", "scientific_search"]
+WATCHDOG_EXIT_CODE = 124
 
 
 @dataclass
@@ -66,6 +68,8 @@ class HLEWithToolsConfig:
     skip_failed_on_resume: bool = False
     mark_incorrect_ids: tuple[str, ...] = ()
     system_prompt_file: Path | None = None
+    stall_timeout_seconds: float = 2100.0
+    api_timeout_seconds: float = 300.0
 
     @property
     def dataset_arg(self) -> str:
@@ -112,6 +116,11 @@ def build_hle_with_tools_config(env: dict[str, str] | None = None, now: str | No
     all_tasks = env_bool(env, "HLE_ALL_TASKS", False)
     num_tasks = None if all_tasks else env_int(env, "NUM_TASKS", env_int(env, "HLE_NUM_EXAMPLES", 1))
     temperature = optional_float(env.get("HLE_TEMPERATURE"))
+    question_timeout_seconds = max(
+        0.0,
+        float(env.get("HLE_QUESTION_TIMEOUT_SECONDS", "1800")),
+    )
+    default_stall_timeout = max(1200.0, question_timeout_seconds + 300.0)
 
     return HLEWithToolsConfig(
         run_id=run_id,
@@ -134,7 +143,7 @@ def build_hle_with_tools_config(env: dict[str, str] | None = None, now: str | No
         disable_scientific_search=env_bool(env, "HLE_DISABLE_SCIENTIFIC_SEARCH", False),
         use_uv=env_bool(env, "HLE_WITH_TOOLS_USE_UV", True),
         progress_interval=float(env.get("HLE_PROGRESS_INTERVAL", "30")),
-        question_timeout_seconds=max(0.0, float(env.get("HLE_QUESTION_TIMEOUT_SECONDS", "1800"))),
+        question_timeout_seconds=question_timeout_seconds,
         skip_failed_on_resume=env_bool(env, "HLE_SKIP_FAILED_ON_RESUME", False),
         mark_incorrect_ids=tuple(
             value.strip()
@@ -142,6 +151,14 @@ def build_hle_with_tools_config(env: dict[str, str] | None = None, now: str | No
             if value.strip()
         ),
         system_prompt_file=Path(system_prompt_file) if system_prompt_file else None,
+        stall_timeout_seconds=max(
+            0.0,
+            float(env.get("HLE_STALL_TIMEOUT_SECONDS", str(default_stall_timeout))),
+        ),
+        api_timeout_seconds=max(
+            1.0,
+            float(env.get("HLE_API_TIMEOUT_SECONDS", "300")),
+        ),
     )
 
 
@@ -192,6 +209,7 @@ def prepare_official_env(config: HLEWithToolsConfig, base_env: dict[str, str] | 
     env["HLE_WITH_TOOLS_TEXT_ONLY"] = "1" if config.text_only else "0"
     env["HLE_MAX_RETRIES"] = str(config.max_retries)
     env["OPENAI_MAX_RETRIES"] = str(config.max_retries)
+    env["HLE_API_TIMEOUT_SECONDS"] = str(config.api_timeout_seconds)
     env["ENABLE_TRACING"] = "true"
     env["ENABLE_CONSOLE_TRACING"] = "false"
     if config.temperature is None:
@@ -217,7 +235,17 @@ def run_official_command(
         interval_seconds=config.progress_interval,
     )
 
-    with stdout_path.open("w", encoding="utf-8") as stdout_file, stderr_path.open("w", encoding="utf-8") as stderr_file:
+    with stdout_path.open("a", encoding="utf-8") as stdout_file, stderr_path.open("a", encoding="utf-8") as stderr_file:
+        started_label = time.strftime("%Y-%m-%d %H:%M:%S")
+        stdout_file.write(f"\n===== official process started {started_label} =====\n")
+        stderr_file.write(f"\n===== official process started {started_label} =====\n")
+        stdout_file.flush()
+        stderr_file.flush()
+        popen_kwargs: dict[str, Any] = {}
+        if os.name == "nt":
+            popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            popen_kwargs["start_new_session"] = True
         process = subprocess.Popen(
             command,
             cwd=config.repo_dir,
@@ -227,16 +255,106 @@ def run_official_command(
             text=True,
             encoding="utf-8",
             errors="replace",
+            **popen_kwargs,
         )
         snapshot = current_progress_state(config)
-        progress.update(snapshot["completed"], extra=format_progress_extra(config, snapshot), force=True)
-        while process.poll() is None:
-            time.sleep(1)
+        terminal_count = terminal_progress_count(snapshot)
+        last_terminal_count = terminal_count
+        last_progress_at = time.monotonic()
+
+        def report_progress(*, force: bool = False) -> None:
+            nonlocal snapshot
             snapshot = current_progress_state(config)
-            progress.update(snapshot["completed"], extra=format_progress_extra(config, snapshot))
-        snapshot = current_progress_state(config)
-        progress.update(snapshot["completed"], extra=format_progress_extra(config, snapshot), force=True)
-        return int(process.returncode or 0)
+            if snapshot["total"]:
+                progress.total = snapshot["total"]
+            progress.update(
+                terminal_progress_count(snapshot),
+                extra=format_progress_extra(config, snapshot),
+                force=force,
+            )
+
+        report_progress(force=True)
+        poll_interval = min(
+            1.0,
+            max(0.05, config.stall_timeout_seconds / 4.0),
+        )
+        try:
+            while process.poll() is None:
+                time.sleep(poll_interval)
+                snapshot = current_progress_state(config)
+                terminal_count = terminal_progress_count(snapshot)
+                if terminal_count != last_terminal_count:
+                    last_terminal_count = terminal_count
+                    last_progress_at = time.monotonic()
+                report_progress()
+                stalled_for = time.monotonic() - last_progress_at
+                if (
+                    config.stall_timeout_seconds > 0
+                    and stalled_for >= config.stall_timeout_seconds
+                ):
+                    message = (
+                        f"Watchdog: no terminal question progress for {stalled_for:.1f}s; "
+                        f"terminating official process group PID {process.pid}."
+                    )
+                    print(message, file=sys.stderr, flush=True)
+                    stderr_file.write(message + "\n")
+                    stderr_file.flush()
+                    terminate_process_group(process)
+                    report_progress(force=True)
+                    return WATCHDOG_EXIT_CODE
+            report_progress(force=True)
+            return int(process.returncode or 0)
+        finally:
+            if process.poll() is None:
+                terminate_process_group(process)
+
+
+def terminate_process_group(process: subprocess.Popen[Any], grace_seconds: float = 10.0) -> None:
+    if process.poll() is not None:
+        return
+    if os.name != "nt":
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except (OSError, ProcessLookupError):
+            return
+    else:
+        try:
+            import psutil
+
+            parent = psutil.Process(process.pid)
+            descendants = parent.children(recursive=True)
+            for descendant in descendants:
+                descendant.terminate()
+            parent.terminate()
+            _, alive = psutil.wait_procs([*descendants, parent], timeout=grace_seconds)
+            for remaining in alive:
+                remaining.kill()
+            psutil.wait_procs(alive, timeout=grace_seconds)
+        except (ImportError, OSError):
+            taskkill = subprocess.run(
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+            if taskkill.returncode != 0 and process.poll() is None:
+                process.terminate()
+    try:
+        process.wait(timeout=grace_seconds)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    if os.name != "nt":
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except (OSError, ProcessLookupError):
+            return
+    else:
+        process.kill()
+    try:
+        process.wait(timeout=grace_seconds)
+    except subprocess.TimeoutExpired:
+        pass
 
 
 def collect_hle_with_tools_outputs(config: HLEWithToolsConfig) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
@@ -430,6 +548,13 @@ def current_prediction_count(config: HLEWithToolsConfig) -> int:
     return current_progress_state(config)["completed"]
 
 
+def terminal_progress_count(snapshot: dict[str, int]) -> int:
+    return sum(
+        max(0, int(snapshot.get(key, 0)))
+        for key in ("completed", "failed", "timed_out", "skipped")
+    )
+
+
 def current_progress_state(config: HLEWithToolsConfig) -> dict[str, int]:
     defaults = {
         "completed": 0,
@@ -453,7 +578,7 @@ def current_progress_state(config: HLEWithToolsConfig) -> dict[str, int]:
 
 
 def format_progress_extra(config: HLEWithToolsConfig, snapshot: dict[str, int]) -> str:
-    details = [f"workers={config.max_workers}"]
+    details = [f"workers={config.max_workers}", f"successful={snapshot['completed']}"]
     if snapshot["total"]:
         details.append(f"total={snapshot['total']}")
     for key in ("running", "failed", "timed_out", "skipped", "pending"):
@@ -606,6 +731,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, help="Base output directory.")
     parser.add_argument("--progress-interval", type=float, help="Seconds between progress updates.")
     parser.add_argument("--question-timeout-seconds", type=float, help="Hard wall-clock limit for one full question trajectory.")
+    parser.add_argument("--stall-timeout-seconds", type=float, help="Restart the official process after this many seconds without a terminal question result (0 disables).")
+    parser.add_argument("--api-timeout-seconds", type=float, help="Timeout for one OpenAI-compatible API request.")
     parser.add_argument("--skip-failed-on-resume", action="store_true", help="Skip IDs already recorded as failed or timed out.")
     parser.add_argument(
         "--mark-incorrect-ids",
@@ -640,6 +767,8 @@ def apply_cli_overrides(env: dict[str, str], args: argparse.Namespace) -> dict[s
         "OUTPUT_DIR": str(args.output_dir) if args.output_dir else None,
         "HLE_PROGRESS_INTERVAL": args.progress_interval,
         "HLE_QUESTION_TIMEOUT_SECONDS": args.question_timeout_seconds,
+        "HLE_STALL_TIMEOUT_SECONDS": args.stall_timeout_seconds,
+        "HLE_API_TIMEOUT_SECONDS": args.api_timeout_seconds,
         "HLE_MARK_INCORRECT_IDS": args.mark_incorrect_ids,
         "HLE_SYSTEM_PROMPT_FILE": str(args.system_prompt_file) if args.system_prompt_file else None,
     }

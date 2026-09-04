@@ -1,16 +1,17 @@
 diff --git a/.env.example b/.env.example
-index 70321c73267363d9d77b7fbf3c5a74a92512dd41..0265c4e37fb9b681950bcc325546563d23453286 100644
+index 70321c7..e79dec5 100644
 --- a/.env.example
 +++ b/.env.example
-@@ -4,3 +4,6 @@ ACTIVELOOP_WORKSPACE = "default"
+@@ -4,3 +4,7 @@ ACTIVELOOP_WORKSPACE = "default"
  ACTIVELOOP_BASE_URL = "https://science-api.activeloop.ai"
  OPENAI_API_KEY= #Judge directly uses openai api key
  HF_TOKEN=
 +HLE_CODE_EXECUTION_TIMEOUT=60
 +HLE_CODE_EXECUTION_STARTUP_TIMEOUT=120
 +HLE_CODE_EXECUTION_START_METHOD=spawn
++HLE_API_TIMEOUT_SECONDS=300
 diff --git a/hle_eval/agent/config.py b/hle_eval/agent/config.py
-index 5f4f02ca52bb52d865985a5c80c7fe7d581ec1f8..2b101a858983dfd23bc5e91ae99e5e4b86aef8ca 100644
+index 5f4f02c..024ef0b 100644
 --- a/hle_eval/agent/config.py
 +++ b/hle_eval/agent/config.py
 @@ -1,3 +1,4 @@
@@ -41,10 +42,11 @@ index 5f4f02ca52bb52d865985a5c80c7fe7d581ec1f8..2b101a858983dfd23bc5e91ae99e5e4b
  client = AsyncOpenAI(
 -    base_url="https://openrouter.ai/api/v1",
 -    api_key=os.environ.get("OPENROUTER_API_KEY"),
+-    timeout=600.0,
+-    max_retries=2
 +    base_url=_base_url,
 +    api_key=os.environ.get("OPENROUTER_API_KEY") or os.environ.get("OPENAI_API_KEY"),
-     timeout=600.0,
--    max_retries=2
++    timeout=float(os.getenv("HLE_API_TIMEOUT_SECONDS", "300")),
 +    max_retries=int(os.getenv("HLE_MAX_RETRIES") or os.getenv("OPENAI_MAX_RETRIES") or "2")
  )
  
@@ -98,50 +100,8 @@ index 5f4f02ca52bb52d865985a5c80c7fe7d581ec1f8..2b101a858983dfd23bc5e91ae99e5e4b
 -TOOLS = [TOOLS[0], TOOLS[1], TOOLS[2]]
 +if DISABLE_SCIENTIFIC_SEARCH:
 +    TOOLS = [tool for tool in TOOLS if tool["function"]["name"] != "scientific_search"]
-diff --git a/hle_eval/agent/ddgs_worker.py b/hle_eval/agent/ddgs_worker.py
-new file mode 100644
-index 0000000000000000000000000000000000000000..875c244d72ba74bb0537e70232cabcaf63b9ef55
---- /dev/null
-+++ b/hle_eval/agent/ddgs_worker.py
-@@ -0,0 +1,36 @@
-+"""Isolated DDGS worker that can be force-killed on timeout."""
-+
-+import json
-+import sys
-+
-+from ddgs import DDGS
-+from ddgs.engines import ENGINES
-+from ddgs.engines.bing import Bing
-+
-+
-+ENGINES.setdefault("text", {})["bing"] = Bing
-+
-+
-+def main() -> int:
-+    try:
-+        request = json.load(sys.stdin)
-+        results = list(
-+            DDGS(timeout=float(request.get("timeout", 10.0))).text(
-+                str(request["query"]),
-+                max_results=int(request["max_results"]),
-+                backend="bing",
-+            )
-+        )
-+        json.dump({"ok": True, "results": results}, sys.stdout, ensure_ascii=False)
-+        return 0
-+    except Exception as exc:
-+        json.dump(
-+            {"ok": False, "error": f"{type(exc).__name__}: {exc}"},
-+            sys.stdout,
-+            ensure_ascii=False,
-+        )
-+        return 0
-+
-+
-+if __name__ == "__main__":
-+    raise SystemExit(main())
 diff --git a/hle_eval/agent/naive.py b/hle_eval/agent/naive.py
-index 77fc2f48b9d121d4fa5422388517ec30015e6061..0d87fb587e3271f04cf3f4c7849502804673727e 100644
+index 77fc2f4..0d87fb5 100644
 --- a/hle_eval/agent/naive.py
 +++ b/hle_eval/agent/naive.py
 @@ -94,6 +94,10 @@ def format_message(question, args, extra_system_prompt: str = None):
@@ -163,7 +123,7 @@ index 77fc2f48b9d121d4fa5422388517ec30015e6061..0d87fb587e3271f04cf3f4c784950280
 \ No newline at end of file
 +    return question["id"], content, tokens
 diff --git a/hle_eval/agent/run_utils.py b/hle_eval/agent/run_utils.py
-index 3c1420f3823a38296f59b1c5c9395592f7cd7615..54b405592a813ee79d9d794d36b07e8c835b5f94 100644
+index 3c1420f..54b4055 100644
 --- a/hle_eval/agent/run_utils.py
 +++ b/hle_eval/agent/run_utils.py
 @@ -8,6 +8,14 @@ from typing import Optional
@@ -238,7 +198,7 @@ index 3c1420f3823a38296f59b1c5c9395592f7cd7615..54b405592a813ee79d9d794d36b07e8c
  
  
 diff --git a/hle_eval/agent/tools.py b/hle_eval/agent/tools.py
-index 85dfb4debdf221d12c1aab5c250fc3447188983a..27692dd1b5d3dd6bbcea9548e7a178c012e3abd8 100644
+index 85dfb4d..0df1e9e 100644
 --- a/hle_eval/agent/tools.py
 +++ b/hle_eval/agent/tools.py
 @@ -8,12 +8,15 @@ import json
@@ -657,7 +617,17 @@ index 85dfb4debdf221d12c1aab5c250fc3447188983a..27692dd1b5d3dd6bbcea9548e7a178c0
  # Tool implementations
  async def web_browsing(query: str, max_results: int = 5, question_id: str = None, is_last_tool: bool = False) -> str:
      """Search the web using DuckDuckGo to find information about a query."""
-@@ -208,15 +571,12 @@ async def web_browsing(query: str, max_results: int = 5, question_id: str = None
+@@ -188,7 +551,8 @@ async def web_browsing(query: str, max_results: int = 5, question_id: str = None
+         max_results = int(max_results)
+     except (ValueError, TypeError):
+         max_results = 5
+-    
++    max_results = max(1, min(max_results, 10))
++
+     if not query or not isinstance(query, str):
+         return "Error: Invalid query parameter."
+ 
+@@ -208,15 +572,12 @@ async def web_browsing(query: str, max_results: int = 5, question_id: str = None
          
          trace_warning(f"web_browsing: Executing DDGS search with query='{search_query}', max_results={max_results}", question_id)
          
@@ -678,7 +648,7 @@ index 85dfb4debdf221d12c1aab5c250fc3447188983a..27692dd1b5d3dd6bbcea9548e7a178c0
              )
          except asyncio.TimeoutError:
              error_msg = f"Search request timed out for query: '{query}'"
-@@ -260,25 +620,8 @@ async def web_browsing(query: str, max_results: int = 5, question_id: str = None
+@@ -260,25 +621,8 @@ async def web_browsing(query: str, max_results: int = 5, question_id: str = None
              title = r.get('title', 'N/A')
              content = r.get('body', 'N/A')
              try:
@@ -706,7 +676,7 @@ index 85dfb4debdf221d12c1aab5c250fc3447188983a..27692dd1b5d3dd6bbcea9548e7a178c0
              except Exception:
                  pass
              return title, content
-@@ -326,7 +669,7 @@ async def get_file_metadata(file_id: str, base_url: str = ACTIVELOOP_BASE_URL, h
+@@ -326,7 +670,7 @@ async def get_file_metadata(file_id: str, base_url: str = ACTIVELOOP_BASE_URL, h
      async with aiohttp.ClientSession() as session:
          headers = dict(headers)
          # headers["accept"] = "application/json"
@@ -715,7 +685,7 @@ index 85dfb4debdf221d12c1aab5c250fc3447188983a..27692dd1b5d3dd6bbcea9548e7a178c0
              if response.status == 200:
                  return await response.json()
              else:
-@@ -338,7 +681,7 @@ async def get_file(file_id: str, base_url: str = ACTIVELOOP_BASE_URL, headers: d
+@@ -338,7 +682,7 @@ async def get_file(file_id: str, base_url: str = ACTIVELOOP_BASE_URL, headers: d
      async with aiohttp.ClientSession() as session:
          headers = dict(headers)
          # headers["accept"] = "application/json"
@@ -724,7 +694,7 @@ index 85dfb4debdf221d12c1aab5c250fc3447188983a..27692dd1b5d3dd6bbcea9548e7a178c0
              if response.status == 200:
                  return await response.content.read()
              else:
-@@ -346,7 +689,7 @@ async def get_file(file_id: str, base_url: str = ACTIVELOOP_BASE_URL, headers: d
+@@ -346,111 +690,76 @@ async def get_file(file_id: str, base_url: str = ACTIVELOOP_BASE_URL, headers: d
  
  
  async def scientific_search(query: str, top_k: int = 10, question_id: str = None, is_last_tool: bool = False) -> str:
@@ -733,7 +703,14 @@ index 85dfb4debdf221d12c1aab5c250fc3447188983a..27692dd1b5d3dd6bbcea9548e7a178c0
      # Ensure top_k is an integer
      try:
          top_k = int(top_k)
-@@ -359,98 +702,62 @@ async def scientific_search(query: str, top_k: int = 10, question_id: str = None
+     except (ValueError, TypeError):
+         top_k = 10
+-    
++    top_k = max(1, min(top_k, 10))
++
+     if not query or not isinstance(query, str):
+         return "Error: Invalid query parameter."
+     
      start_time = trace_tool_call("scientific_search", {"query": query, "top_k": top_k}, question_id, indent_level=2)
      
      try:
@@ -783,8 +760,7 @@ index 85dfb4debdf221d12c1aab5c250fc3447188983a..27692dd1b5d3dd6bbcea9548e7a178c0
 +        search_query = f"{query} -site:huggingface.co"
 +        if query.startswith(('http://', 'https://')):
 +            search_query = urlparse(query).netloc
- 
--        if 'choices' in result and len(result['choices']) > 0:
++
 +        search_timeout = _positive_timeout_from_env(
 +            "HLE_SCIENTIFIC_SEARCH_TIMEOUT",
 +            20.0,
@@ -794,7 +770,8 @@ index 85dfb4debdf221d12c1aab5c250fc3447188983a..27692dd1b5d3dd6bbcea9548e7a178c0
 +            max_results=top_k + 3,
 +            timeout=search_timeout,
 +        )
-+
+ 
+-        if 'choices' in result and len(result['choices']) > 0:
 +        filtered_results = []
 +        result_titles = []
 +        for result in raw_results:
@@ -882,7 +859,7 @@ index 85dfb4debdf221d12c1aab5c250fc3447188983a..27692dd1b5d3dd6bbcea9548e7a178c0
      except asyncio.TimeoutError:
          error_msg = f"Search request timed out for query: '{query}'"
          trace_tool_result("scientific_search", error_msg, success=False, question_id=question_id, indent_level=2, is_last_tool=is_last_tool, start_time=start_time)
-@@ -606,50 +913,32 @@ async def code_interpreter(code: str, question_id: str = None, is_last_tool: boo
+@@ -606,50 +915,32 @@ async def code_interpreter(code: str, question_id: str = None, is_last_tool: boo
          with open(code_file_path, "a", encoding="utf-8") as f:
              f.write(code + "\n\n")
      
@@ -951,7 +928,7 @@ index 85dfb4debdf221d12c1aab5c250fc3447188983a..27692dd1b5d3dd6bbcea9548e7a178c0
              
              if stderr_output:
                  result = f"Error: {stderr_output}\nOutput: {stdout_output}"
-@@ -699,7 +988,7 @@ def get_model_name(args, question_id: str):
+@@ -699,7 +990,7 @@ def get_model_name(args, question_id: str):
      return args.model
  
  
@@ -960,7 +937,7 @@ index 85dfb4debdf221d12c1aab5c250fc3447188983a..27692dd1b5d3dd6bbcea9548e7a178c0
      """Configure tools and tool_choice based on current iteration.
      
      Strategy:
-@@ -710,27 +999,35 @@ def configure_tools_for_iteration(iteration: int, max_iterations: int, messages:
+@@ -710,27 +1001,35 @@ def configure_tools_for_iteration(iteration: int, max_iterations: int, messages:
      while preventing it from gathering new information in the final step.
      Note: The final forced answer call (after loop) disables all tools via make_final_answer_call.
      """
@@ -1003,7 +980,7 @@ index 85dfb4debdf221d12c1aab5c250fc3447188983a..27692dd1b5d3dd6bbcea9548e7a178c0
      
      return tools_available, tool_choice
  
-@@ -1011,17 +1308,24 @@ def check_and_break_tool_loop(consecutive_tool_only_iterations: int, iteration:
+@@ -1011,17 +1310,24 @@ def check_and_break_tool_loop(consecutive_tool_only_iterations: int, iteration:
  async def handle_tool_calls(message, messages: list, question_id: str, iteration: int, max_iterations: int,
                             recent_tool_calls: list, message_content: str, api_start_time: int,
                             iteration_start_time: int, reasoning: str, total_tokens: dict, tool_outputs_hash: set = None,
@@ -1031,7 +1008,7 @@ index 85dfb4debdf221d12c1aab5c250fc3447188983a..27692dd1b5d3dd6bbcea9548e7a178c0
      # Keep only last 3 iterations
      if len(recent_tool_calls) > 3:
          recent_tool_calls.pop(0)
-@@ -1046,15 +1350,38 @@ async def handle_tool_calls(message, messages: list, question_id: str, iteration
+@@ -1046,15 +1352,38 @@ async def handle_tool_calls(message, messages: list, question_id: str, iteration
      for idx, tool_call in enumerate(message.tool_calls):
          # Create a hash of function name AND arguments to detect exact duplicates
          # e.g., web_browsing("Piet programming language") called twice
@@ -1073,7 +1050,7 @@ index 85dfb4debdf221d12c1aab5c250fc3447188983a..27692dd1b5d3dd6bbcea9548e7a178c0
              continue  # Skip execution of duplicate
          
          tool_calls_history.add(call_signature)
-@@ -1083,11 +1410,14 @@ async def handle_tool_calls(message, messages: list, question_id: str, iteration
+@@ -1083,11 +1412,14 @@ async def handle_tool_calls(message, messages: list, question_id: str, iteration
      # Detect repetitive tool call patterns
      if len(recent_tool_calls) >= 2:
          if recent_tool_calls[-1] == recent_tool_calls[-2]:
@@ -1090,7 +1067,7 @@ index 85dfb4debdf221d12c1aab5c250fc3447188983a..27692dd1b5d3dd6bbcea9548e7a178c0
                  })
      
      # print(f"  {_colorize('└─', Colors.BRIGHT_BLUE)}\n")
-@@ -1137,8 +1467,8 @@ async def make_final_answer_call(messages, args, max_iterations: int, question_i
+@@ -1137,8 +1469,8 @@ async def make_final_answer_call(messages, args, max_iterations: int, question_i
              temperature=args.temperature,
              max_completion_tokens=args.max_completion_tokens,
              messages=messages,
@@ -1101,7 +1078,7 @@ index 85dfb4debdf221d12c1aab5c250fc3447188983a..27692dd1b5d3dd6bbcea9548e7a178c0
              stream=False,
              extra_body=EXTRA_BODY
          )
-@@ -1255,6 +1585,13 @@ async def attempt_question(question, args, max_iterations: int = 15):
+@@ -1255,6 +1587,13 @@ async def attempt_question(question, args, max_iterations: int = 15):
      consecutive_tool_only_iterations = 0
      tool_outputs_hash = set()  # Track tool output content to detect repeated outputs
      tool_calls_history = set()  # Track tool call signatures (function name + arguments) to detect exact duplicates
@@ -1115,7 +1092,7 @@ index 85dfb4debdf221d12c1aab5c250fc3447188983a..27692dd1b5d3dd6bbcea9548e7a178c0
      
      try:
          while iteration < max_iterations:
-@@ -1266,19 +1603,23 @@ async def attempt_question(question, args, max_iterations: int = 15):
+@@ -1266,19 +1605,23 @@ async def attempt_question(question, args, max_iterations: int = 15):
              # Get model name and configure tools
              model_name = get_model_name(args, question_id)
              api_start_time = trace_api_call(model_name, iteration, question_id, messages=messages)
@@ -1150,7 +1127,7 @@ index 85dfb4debdf221d12c1aab5c250fc3447188983a..27692dd1b5d3dd6bbcea9548e7a178c0
              
              message = response.choices[0].message
              message_content, reasoning, reasoning_field_name = extract_content_and_reasoning(message)
-@@ -1310,11 +1651,15 @@ async def attempt_question(question, args, max_iterations: int = 15):
+@@ -1310,11 +1653,15 @@ async def attempt_question(question, args, max_iterations: int = 15):
                      consecutive_tool_only_iterations = 0
                  
                  # Check and break tool loop if needed
@@ -1167,7 +1144,7 @@ index 85dfb4debdf221d12c1aab5c250fc3447188983a..27692dd1b5d3dd6bbcea9548e7a178c0
                      continue
                  
                  # Handle tool calls
-@@ -1322,7 +1667,8 @@ async def attempt_question(question, args, max_iterations: int = 15):
+@@ -1322,7 +1669,8 @@ async def attempt_question(question, args, max_iterations: int = 15):
                      message, messages, question_id, iteration, max_iterations,
                      recent_tool_calls, message_content, api_start_time,
                      iteration_start_time, reasoning, total_tokens, tool_outputs_hash,
@@ -1177,62 +1154,15 @@ index 85dfb4debdf221d12c1aab5c250fc3447188983a..27692dd1b5d3dd6bbcea9548e7a178c0
                  )
                  continue
              
-@@ -1544,4 +1890,4 @@ print("Objective value =", pulp.value(problem.objective))
+@@ -1544,4 +1892,4 @@ print("Objective value =", pulp.value(problem.objective))
          f.write(result)
      exit()
  
 -    print(result)
 \ No newline at end of file
 +    print(result)
-diff --git a/hle_eval/agent/web_fetch_worker.py b/hle_eval/agent/web_fetch_worker.py
-new file mode 100644
-index 0000000000000000000000000000000000000000..eae07346bfe290200a5e5fffba356ff5c7a0fed6
---- /dev/null
-+++ b/hle_eval/agent/web_fetch_worker.py
-@@ -0,0 +1,41 @@
-+"""Isolated webpage fetch worker that can be force-killed on timeout."""
-+
-+import json
-+import sys
-+
-+import requests
-+from bs4 import BeautifulSoup
-+
-+
-+def main() -> int:
-+    try:
-+        request = json.load(sys.stdin)
-+        response = requests.get(
-+            str(request["url"]),
-+            headers=request.get("headers") or {},
-+            timeout=float(request.get("timeout", 8.0)),
-+        )
-+        soup = BeautifulSoup(response.text, "html.parser")
-+        for tag in soup(["script", "style", "nav", "footer"]):
-+            tag.decompose()
-+        content = soup.get_text(separator="\n", strip=True)
-+        if len(content) > 1000:
-+            truncated = content[:1000]
-+            last_newline = truncated.rfind("\n")
-+            if last_newline > 800:
-+                content = truncated[:last_newline] + "\n..."
-+            else:
-+                content = truncated + "..."
-+        json.dump({"ok": True, "content": content}, sys.stdout, ensure_ascii=False)
-+        return 0
-+    except Exception as exc:
-+        json.dump(
-+            {"ok": False, "error": f"{type(exc).__name__}: {exc}"},
-+            sys.stdout,
-+            ensure_ascii=False,
-+        )
-+        return 0
-+
-+
-+if __name__ == "__main__":
-+    raise SystemExit(main())
 diff --git a/hle_eval/run_agent_predictions.py b/hle_eval/run_agent_predictions.py
-index ec2dc9592cc50abab102a0093d0974f6a766c997..3ec5267b9ac52e4db890bde7f57894b5a8e11832 100644
+index ec2dc95..19f09c3 100644
 --- a/hle_eval/run_agent_predictions.py
 +++ b/hle_eval/run_agent_predictions.py
 @@ -15,6 +15,10 @@ import os
@@ -1246,7 +1176,7 @@ index ec2dc9592cc50abab102a0093d0974f6a766c997..3ec5267b9ac52e4db890bde7f57894b5
  from datasets import load_dataset
  from openai import AsyncOpenAI
  from tqdm.asyncio import tqdm_asyncio
-@@ -24,47 +28,340 @@ from hle_eval.agent.config import client
+@@ -24,47 +28,346 @@ from hle_eval.agent.config import client
  from hle_eval.agent.config import EXTRA_BODY
  from hle_eval.agent.run_utils import set_run_directory, get_predictions_path, get_judged_predictions_path
  from hle_eval.agent.tools import attempt_question as agent_attempt_question
@@ -1431,12 +1361,16 @@ index ec2dc9592cc50abab102a0093d0974f6a766c997..3ec5267b9ac52e4db890bde7f57894b5
 +        elif prediction.get("termination_reason") == "infrastructure_error":
 +            failed_ids.append(str(question_id))
 +    initial_record_count = len(predictions)
-+    initial_completed = initial_record_count - len(failed_ids) - len(timed_out_ids)
++    initial_failed_count = len(failed_ids)
++    initial_timed_out_count = len(timed_out_ids)
++    initial_completed = initial_record_count - initial_failed_count - initial_timed_out_count
 +    successful_this_run = 0
 +    skipped_ids = {str(question_id) for question_id in (skipped_ids or set())}
 +
 +    def progress_payload():
-+        finished_this_run = successful_this_run + len(failed_ids) + len(timed_out_ids)
++        failed_this_run = len(failed_ids) - initial_failed_count
++        timed_out_this_run = len(timed_out_ids) - initial_timed_out_count
++        finished_this_run = successful_this_run + failed_this_run + timed_out_this_run
 +        return {
 +            "total": initial_record_count + len(questions) + len(skipped_ids),
 +            "initial_completed": initial_completed,
@@ -1466,14 +1400,16 @@ index ec2dc9592cc50abab102a0093d0974f6a766c997..3ec5267b9ac52e4db890bde7f57894b5
 +                    failed_ids.append(question_id)
 +                elif status == "timed_out":
 +                    timed_out_ids.append(question_id)
-+            atomic_write_json(progress_path, progress_payload())
++            payload = progress_payload()
++            await asyncio.to_thread(atomic_write_json, progress_path, payload)
 +
 +    await update_progress()
 +
 +    async def store_prediction(question_id, prediction):
 +        async with write_lock:
 +            predictions[str(question_id)] = prediction
-+            atomic_write_json(temp_filepath, predictions)
++            snapshot = dict(predictions)
++            await asyncio.to_thread(atomic_write_json, temp_filepath, snapshot)
      
      async def bound_func(question):
          async with semaphore:
@@ -1609,7 +1545,7 @@ index ec2dc9592cc50abab102a0093d0974f6a766c997..3ec5267b9ac52e4db890bde7f57894b5
      
  def filter_none_and_incorrect_questions(questions, judged_path, model_id):
      """
-@@ -100,20 +397,29 @@ def filter_none_and_incorrect_questions(questions, judged_path, model_id):
+@@ -100,20 +403,29 @@ def filter_none_and_incorrect_questions(questions, judged_path, model_id):
  def main(args):
      assert args.num_workers > 1, "num_workers must be 2 or greater"
  
@@ -1645,7 +1581,7 @@ index ec2dc9592cc50abab102a0093d0974f6a766c997..3ec5267b9ac52e4db890bde7f57894b5
      
  
      
-@@ -146,7 +452,6 @@ def main(args):
+@@ -146,7 +458,6 @@ def main(args):
                      predictions = json.loads(content)
                  else:
                      print(f"Warning: {output_filepath} is empty, starting fresh")
@@ -1653,7 +1589,7 @@ index ec2dc9592cc50abab102a0093d0974f6a766c997..3ec5267b9ac52e4db890bde7f57894b5
          except json.JSONDecodeError as e:
              print(f"Warning: Failed to parse {output_filepath}: {e}. Starting fresh.")
              predictions = {}
-@@ -159,20 +464,42 @@ def main(args):
+@@ -159,20 +470,42 @@ def main(args):
                      predictions = json.loads(content)
                  else:
                      print(f"Warning: {temp_filepath} is empty, starting fresh")
@@ -1698,7 +1634,7 @@ index ec2dc9592cc50abab102a0093d0974f6a766c997..3ec5267b9ac52e4db890bde7f57894b5
  
          # Process any remaining None results (API call failures)
          # Note: Successful results are already written incrementally in attempt_all
-@@ -181,6 +508,7 @@ def main(args):
+@@ -181,6 +514,7 @@ def main(args):
                  continue
              # Already processed in attempt_all, but ensure it's in predictions
              unique_id, response, usage = result
@@ -1706,7 +1642,7 @@ index ec2dc9592cc50abab102a0093d0974f6a766c997..3ec5267b9ac52e4db890bde7f57894b5
              if unique_id not in predictions:
                  predictions[unique_id] = {
                      "model": args.model,
-@@ -233,6 +561,30 @@ if __name__ == "__main__":
+@@ -233,6 +567,30 @@ if __name__ == "__main__":
      parser.add_argument("--temperature", type=float, default=0.0, help="Temperature for sampling.")
      parser.add_argument("--num_workers", type=int, default=10, help="Async semaphore size. This depends on your rate limit.")
      parser.add_argument("--max_samples", type=int, default=None, help="Limit evaluation to first N samples")
@@ -1738,7 +1674,7 @@ index ec2dc9592cc50abab102a0093d0974f6a766c997..3ec5267b9ac52e4db890bde7f57894b5
 +        parser.error("--num_rollouts must be at least 1")
      main(args)
 diff --git a/pyproject.toml b/pyproject.toml
-index 4464ca37b31fe7773a19404373d48b5fb182aceb..e08b7c7fd69784e24148158b12760cb1d8c32e55 100644
+index 4464ca3..e08b7c7 100644
 --- a/pyproject.toml
 +++ b/pyproject.toml
 @@ -17,7 +17,7 @@ dependencies = [
@@ -1750,9 +1686,98 @@ index 4464ca37b31fe7773a19404373d48b5fb182aceb..e08b7c7fd69784e24148158b12760cb1
      "dotenv>=0.9.9",
      "matplotlib>=3.10.7",
      "networkx>=3.5",
+diff --git a/hle_eval/agent/ddgs_worker.py b/hle_eval/agent/ddgs_worker.py
+new file mode 100644
+index 0000000..875c244
+--- /dev/null
++++ b/hle_eval/agent/ddgs_worker.py
+@@ -0,0 +1,36 @@
++"""Isolated DDGS worker that can be force-killed on timeout."""
++
++import json
++import sys
++
++from ddgs import DDGS
++from ddgs.engines import ENGINES
++from ddgs.engines.bing import Bing
++
++
++ENGINES.setdefault("text", {})["bing"] = Bing
++
++
++def main() -> int:
++    try:
++        request = json.load(sys.stdin)
++        results = list(
++            DDGS(timeout=float(request.get("timeout", 10.0))).text(
++                str(request["query"]),
++                max_results=int(request["max_results"]),
++                backend="bing",
++            )
++        )
++        json.dump({"ok": True, "results": results}, sys.stdout, ensure_ascii=False)
++        return 0
++    except Exception as exc:
++        json.dump(
++            {"ok": False, "error": f"{type(exc).__name__}: {exc}"},
++            sys.stdout,
++            ensure_ascii=False,
++        )
++        return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/hle_eval/agent/web_fetch_worker.py b/hle_eval/agent/web_fetch_worker.py
+new file mode 100644
+index 0000000..eae0734
+--- /dev/null
++++ b/hle_eval/agent/web_fetch_worker.py
+@@ -0,0 +1,41 @@
++"""Isolated webpage fetch worker that can be force-killed on timeout."""
++
++import json
++import sys
++
++import requests
++from bs4 import BeautifulSoup
++
++
++def main() -> int:
++    try:
++        request = json.load(sys.stdin)
++        response = requests.get(
++            str(request["url"]),
++            headers=request.get("headers") or {},
++            timeout=float(request.get("timeout", 8.0)),
++        )
++        soup = BeautifulSoup(response.text, "html.parser")
++        for tag in soup(["script", "style", "nav", "footer"]):
++            tag.decompose()
++        content = soup.get_text(separator="\n", strip=True)
++        if len(content) > 1000:
++            truncated = content[:1000]
++            last_newline = truncated.rfind("\n")
++            if last_newline > 800:
++                content = truncated[:last_newline] + "\n..."
++            else:
++                content = truncated + "..."
++        json.dump({"ok": True, "content": content}, sys.stdout, ensure_ascii=False)
++        return 0
++    except Exception as exc:
++        json.dump(
++            {"ok": False, "error": f"{type(exc).__name__}: {exc}"},
++            sys.stdout,
++            ensure_ascii=False,
++        )
++        return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
 diff --git a/tests/test_code_interpreter_timeout.py b/tests/test_code_interpreter_timeout.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..a4d9323a0b3ca4da613c2e83f18a2fe10d8127a2
+index 0000000..a4d9323
 --- /dev/null
 +++ b/tests/test_code_interpreter_timeout.py
 @@ -0,0 +1,93 @@
@@ -1851,18 +1876,19 @@ index 0000000000000000000000000000000000000000..a4d9323a0b3ca4da613c2e83f18a2fe1
 +    unittest.main()
 diff --git a/tests/test_question_timeout_progress.py b/tests/test_question_timeout_progress.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..8f45578c92d3aac25a259b063f3e8412d428985e
+index 0000000..f8e7df2
 --- /dev/null
 +++ b/tests/test_question_timeout_progress.py
-@@ -0,0 +1,114 @@
+@@ -0,0 +1,203 @@
 +import asyncio
 +import json
 +import os
 +import tempfile
++import time
 +import unittest
 +from pathlib import Path
 +from types import SimpleNamespace
-+from unittest.mock import patch
++from unittest.mock import AsyncMock, patch
 +
 +os.environ.setdefault("OPENAI_API_KEY", "test-key")
 +
@@ -1870,6 +1896,94 @@ index 0000000000000000000000000000000000000000..8f45578c92d3aac25a259b063f3e8412
 +
 +
 +class QuestionTimeoutProgressTests(unittest.TestCase):
++    def test_checkpoint_writes_do_not_block_the_event_loop(self):
++        async def fake_attempt(question, args, max_iterations):
++            return question["id"], "answer", {"total_tokens": 1}
++
++        def slow_write(path, payload):
++            time.sleep(0.1)
++
++        async def run_scenario():
++            ticks = 0
++            finished = False
++
++            async def heartbeat():
++                nonlocal ticks
++                while not finished:
++                    ticks += 1
++                    await asyncio.sleep(0.01)
++
++            heartbeat_task = asyncio.create_task(heartbeat())
++            try:
++                await run_agent_predictions.attempt_all(
++                    [{"id": "fresh"}],
++                    SimpleNamespace(
++                        num_workers=1,
++                        max_iterations=15,
++                        model="test-model",
++                        question_timeout_seconds=30,
++                    ),
++                    {},
++                    str(Path(tempfile.gettempdir()) / "hle_async_write_test.json.temp"),
++                )
++            finally:
++                finished = True
++                await heartbeat_task
++            return ticks
++
++        with patch.object(run_agent_predictions, "agent_attempt_question", fake_attempt), patch.object(
++            run_agent_predictions,
++            "atomic_write_json",
++            side_effect=slow_write,
++        ):
++            ticks = asyncio.run(run_scenario())
++
++        self.assertGreaterEqual(ticks, 5)
++
++    def test_resume_pending_does_not_subtract_historical_failures_twice(self):
++        async def discard_tasks(*tasks):
++            for task in tasks:
++                task.close()
++            return []
++
++        args = SimpleNamespace(
++            num_workers=1,
++            max_iterations=15,
++            model="test-model",
++            question_timeout_seconds=30,
++        )
++        predictions = {
++            "old-timeout": run_agent_predictions.make_incorrect_prediction(
++                {"id": "old-timeout"},
++                "test-model",
++                "QuestionTimeout",
++                "Historical timeout.",
++                "timed_out",
++            )
++        }
++
++        with tempfile.TemporaryDirectory() as tmp:
++            temp_path = str(Path(tmp) / "hle_test.json.temp")
++            with patch.object(
++                run_agent_predictions.tqdm_asyncio,
++                "gather",
++                new=AsyncMock(side_effect=discard_tasks),
++            ):
++                asyncio.run(
++                    run_agent_predictions.attempt_all(
++                        [{"id": "fresh"}],
++                        args,
++                        predictions,
++                        temp_path,
++                    )
++                )
++
++            state = json.loads(Path(tmp, "progress_state.json").read_text(encoding="utf-8"))
++
++        self.assertEqual(state["total"], 2)
++        self.assertEqual(state["timed_out"], 1)
++        self.assertEqual(state["pending"], 1)
++
 +    def test_completed_numeric_question_id_is_filtered_after_json_resume(self):
 +        questions = [{"id": 16}, {"id": "17"}]
 +
@@ -1971,10 +2085,10 @@ index 0000000000000000000000000000000000000000..8f45578c92d3aac25a259b063f3e8412
 +    unittest.main()
 diff --git a/tests/test_search_timeout.py b/tests/test_search_timeout.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..1fc64255a586586b439a9a44be605524fbaedc2d
+index 0000000..538524a
 --- /dev/null
 +++ b/tests/test_search_timeout.py
-@@ -0,0 +1,146 @@
+@@ -0,0 +1,159 @@
 +import asyncio
 +import os
 +import socket
@@ -1989,6 +2103,19 @@ index 0000000000000000000000000000000000000000..1fc64255a586586b439a9a44be605524
 +
 +
 +class SearchTimeoutTests(unittest.TestCase):
++    def test_search_result_counts_are_capped(self):
++        requested_counts = []
++
++        async def fake_search(query, max_results, timeout):
++            requested_counts.append(max_results)
++            return []
++
++        with mock.patch.object(tools, "_run_ddgs_search", side_effect=fake_search):
++            asyncio.run(tools.web_browsing("cap test", max_results=999))
++            asyncio.run(tools.scientific_search("cap test", top_k=999))
++
++        self.assertEqual(requested_counts, [13, 13])
++
 +    def test_timed_out_search_does_not_wait_for_background_worker(self):
 +        class SlowDDGS:
 +            def __init__(self, *args, **kwargs):
@@ -2123,7 +2250,7 @@ index 0000000000000000000000000000000000000000..1fc64255a586586b439a9a44be605524
 +    unittest.main()
 diff --git a/tests/test_system_prompt_file.py b/tests/test_system_prompt_file.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..75e4ae2fc058d22b51bf3bfcdf29a12b124a7c60
+index 0000000..75e4ae2
 --- /dev/null
 +++ b/tests/test_system_prompt_file.py
 @@ -0,0 +1,37 @@
