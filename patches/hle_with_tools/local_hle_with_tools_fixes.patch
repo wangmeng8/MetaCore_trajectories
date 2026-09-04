@@ -1,0 +1,1960 @@
+diff --git a/.env.example b/.env.example
+index 70321c7..0265c4e 100644
+--- a/.env.example
++++ b/.env.example
+@@ -4,3 +4,6 @@ ACTIVELOOP_WORKSPACE = "default"
+ ACTIVELOOP_BASE_URL = "https://science-api.activeloop.ai"
+ OPENAI_API_KEY= #Judge directly uses openai api key
+ HF_TOKEN=
++HLE_CODE_EXECUTION_TIMEOUT=60
++HLE_CODE_EXECUTION_STARTUP_TIMEOUT=120
++HLE_CODE_EXECUTION_START_METHOD=spawn
+diff --git a/hle_eval/agent/config.py b/hle_eval/agent/config.py
+index 5f4f02c..2b101a8 100644
+--- a/hle_eval/agent/config.py
++++ b/hle_eval/agent/config.py
+@@ -1,3 +1,4 @@
++import json
+ import os
+ from openai import AsyncOpenAI
+ 
+@@ -6,11 +7,27 @@ from dotenv import load_dotenv
+ # Load environment variables from a .env file into the environment, if present
+ load_dotenv()
+ 
++def _env_bool(name: str, default: bool = False) -> bool:
++    value = os.getenv(name)
++    if value is None or value == "":
++        return default
++    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
++
++
++DISABLE_SCIENTIFIC_SEARCH = _env_bool("HLE_DISABLE_SCIENTIFIC_SEARCH", False)
++
++
++_base_url = (
++    os.getenv("OPENAI_BASE_URL")
++    or os.getenv("OPENROUTER_BASE_URL")
++    or "https://openrouter.ai/api/v1"
++)
++
+ client = AsyncOpenAI(
+-    base_url="https://openrouter.ai/api/v1",
+-    api_key=os.environ.get("OPENROUTER_API_KEY"),
++    base_url=_base_url,
++    api_key=os.environ.get("OPENROUTER_API_KEY") or os.environ.get("OPENAI_API_KEY"),
+     timeout=600.0,
+-    max_retries=2
++    max_retries=int(os.getenv("HLE_MAX_RETRIES") or os.getenv("OPENAI_MAX_RETRIES") or "2")
+ )
+ 
+ AL_TOKEN = os.getenv("ACTIVELOOP_API_KEY")
+@@ -24,7 +41,7 @@ ACTIVELOOP_HEADERS = {
+     "Content-Type": "application/json"
+ }
+ 
+-EXTRA_BODY = {
++_OPENROUTER_EXTRA_BODY = {
+     "provider": {
+         "only": [
+             "google-vertex",
+@@ -38,6 +55,15 @@ EXTRA_BODY = {
+     }, 
+ }
+ 
++if os.getenv("HLE_WITH_TOOLS_EXTRA_BODY_JSON"):
++    EXTRA_BODY = json.loads(os.environ["HLE_WITH_TOOLS_EXTRA_BODY_JSON"])
++elif _env_bool("HLE_WITH_TOOLS_USE_OPENROUTER_DEFAULTS", False):
++    EXTRA_BODY = _OPENROUTER_EXTRA_BODY
++elif _env_bool("HLE_WITH_TOOLS_DISABLE_EXTRA_BODY", False) or os.getenv("OPENAI_BASE_URL"):
++    EXTRA_BODY = {}
++else:
++    EXTRA_BODY = _OPENROUTER_EXTRA_BODY
++
+ TOOL_SELECTION_GUIDE = """TOOL SELECTION GUIDANCE:
+ 
+ Tool Decision Tree:
+@@ -121,6 +147,16 @@ IMPORTANT TOOL USAGE REMINDERS:
+ 
+ SYSTEM_EXACT_ANSWER += TOOL_SELECTION_GUIDE
+ SYSTEM_MC += TOOL_SELECTION_GUIDE
++if DISABLE_SCIENTIFIC_SEARCH:
++    scientific_search_disabled_notice = """
++
++RUN CONFIGURATION:
++- scientific_search is unavailable and disabled for this run.
++- Use web_browsing for academic, technical, and general web lookup.
++- Do not request or plan to use scientific_search.
++"""
++    SYSTEM_EXACT_ANSWER += scientific_search_disabled_notice
++    SYSTEM_MC += scientific_search_disabled_notice
+ 
+ # Tool definitions for OpenAI
+ TOOLS = [
+@@ -265,4 +301,5 @@ TOOLS = [
+     }
+ ]
+ 
+-TOOLS = [TOOLS[0], TOOLS[1], TOOLS[2]]
++if DISABLE_SCIENTIFIC_SEARCH:
++    TOOLS = [tool for tool in TOOLS if tool["function"]["name"] != "scientific_search"]
+diff --git a/hle_eval/agent/ddgs_worker.py b/hle_eval/agent/ddgs_worker.py
+new file mode 100644
+index 0000000..875c244
+--- /dev/null
++++ b/hle_eval/agent/ddgs_worker.py
+@@ -0,0 +1,36 @@
++"""Isolated DDGS worker that can be force-killed on timeout."""
++
++import json
++import sys
++
++from ddgs import DDGS
++from ddgs.engines import ENGINES
++from ddgs.engines.bing import Bing
++
++
++ENGINES.setdefault("text", {})["bing"] = Bing
++
++
++def main() -> int:
++    try:
++        request = json.load(sys.stdin)
++        results = list(
++            DDGS(timeout=float(request.get("timeout", 10.0))).text(
++                str(request["query"]),
++                max_results=int(request["max_results"]),
++                backend="bing",
++            )
++        )
++        json.dump({"ok": True, "results": results}, sys.stdout, ensure_ascii=False)
++        return 0
++    except Exception as exc:
++        json.dump(
++            {"ok": False, "error": f"{type(exc).__name__}: {exc}"},
++            sys.stdout,
++            ensure_ascii=False,
++        )
++        return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/hle_eval/agent/naive.py b/hle_eval/agent/naive.py
+index 77fc2f4..0d87fb5 100644
+--- a/hle_eval/agent/naive.py
++++ b/hle_eval/agent/naive.py
+@@ -94,6 +94,10 @@ def format_message(question, args, extra_system_prompt: str = None):
+ 
+     if extra_system_prompt:
+         system_prompt = f"{system_prompt}\n{extra_system_prompt}"
++
++    system_prompt_addendum = getattr(args, "system_prompt_addendum", None)
++    if system_prompt_addendum:
++        system_prompt = f"{system_prompt.rstrip()}\n\n{system_prompt_addendum.strip()}"
+         
+     messages = [
+         {"role": system_role, "content": system_prompt}, 
+@@ -130,4 +134,4 @@ async def attempt_question(question, args):
+     if content in [None, "", "\n", " \n"]: # failed
+         return None
+     
+-    return question["id"], content, tokens
+\ No newline at end of file
++    return question["id"], content, tokens
+diff --git a/hle_eval/agent/run_utils.py b/hle_eval/agent/run_utils.py
+index 3c1420f..54b4055 100644
+--- a/hle_eval/agent/run_utils.py
++++ b/hle_eval/agent/run_utils.py
+@@ -8,6 +8,14 @@ from typing import Optional
+ _current_run_dir: Optional[str] = None
+ 
+ 
++def _runs_base_dir(base_dir: str = "runs") -> str:
++    return os.getenv("HLE_WITH_TOOLS_RUNS_DIR") or base_dir
++
++
++def _safe_run_name(model_id: str) -> str:
++    return os.getenv("HLE_WITH_TOOLS_RUN_NAME") or model_id.replace("/", "_").replace("\\", "_").replace(":", "_")
++
++
+ def set_run_directory(model_id: str, base_dir: str = "runs") -> str:
+     """
+     Set up and return the run directory for a given model_id.
+@@ -21,9 +29,8 @@ def set_run_directory(model_id: str, base_dir: str = "runs") -> str:
+     """
+     global _current_run_dir
+     
+-    # Sanitize model_id for filesystem (replace problematic characters)
+-    safe_model_id = model_id.replace("/", "_").replace("\\", "_").replace(":", "_")
+-    run_dir = os.path.join(base_dir, safe_model_id)
++    base_dir = _runs_base_dir(base_dir)
++    run_dir = os.path.join(base_dir, _safe_run_name(model_id))
+     
+     # Create the directory structure
+     os.makedirs(run_dir, exist_ok=True)
+@@ -55,8 +62,9 @@ def get_predictions_path(model_id: str, base_dir: str = "runs") -> str:
+     Returns:
+         Path to predictions file
+     """
++    base_dir = _runs_base_dir(base_dir)
+     safe_model_id = model_id.replace("/", "_").replace("\\", "_").replace(":", "_")
+-    run_dir = os.path.join(base_dir, safe_model_id)
++    run_dir = os.path.join(base_dir, _safe_run_name(model_id))
+     return os.path.join(run_dir, f"hle_{safe_model_id}.json")
+ 
+ 
+@@ -73,8 +81,9 @@ def get_judged_predictions_path(model_id: str, base_dir: str = "runs") -> str:
+     """
+     # Extract model_id from predictions path
+     # Handle both old format (hle_model.json) and new format (runs/model_id/hle_model.json)
++    base_dir = _runs_base_dir(base_dir)
+     safe_model_id = model_id.replace("/", "_").replace("\\", "_").replace(":", "_")
+-    run_dir = os.path.join(base_dir, safe_model_id)
++    run_dir = os.path.join(base_dir, _safe_run_name(model_id))
+     return os.path.join(run_dir, f"judged_{safe_model_id}.json")
+ 
+ 
+@@ -91,8 +100,9 @@ def get_trace_log_path(model_id: str, question_id: Optional[str] = None, base_di
+         Path to trace log file. If question_id is provided, returns a unique file per question.
+         Otherwise returns the default trace.log file.
+     """
++    base_dir = _runs_base_dir(base_dir)
+     safe_model_id = model_id.replace("/", "_").replace("\\", "_").replace(":", "_")
+-    run_dir = os.path.join(base_dir, safe_model_id)
++    run_dir = os.path.join(base_dir, _safe_run_name(model_id))
+     
+     if question_id:
+         # Sanitize question_id for filesystem
+@@ -113,8 +123,8 @@ def get_code_dir(model_id: str, base_dir: str = "runs") -> str:
+     Returns:
+         Path to code directory
+     """
+-    safe_model_id = model_id.replace("/", "_").replace("\\", "_").replace(":", "_")
+-    run_dir = os.path.join(base_dir, safe_model_id)
++    base_dir = _runs_base_dir(base_dir)
++    run_dir = os.path.join(base_dir, _safe_run_name(model_id))
+     return os.path.join(run_dir, "code")
+ 
+ 
+diff --git a/hle_eval/agent/tools.py b/hle_eval/agent/tools.py
+index 85dfb4d..65b6e46 100644
+--- a/hle_eval/agent/tools.py
++++ b/hle_eval/agent/tools.py
+@@ -8,12 +8,17 @@ import json
+ import ast
+ import io
+ import asyncio
++import multiprocessing
++import sys
+ import requests
+ import aiohttp
++import signal
+ from datetime import datetime
+ from bs4 import BeautifulSoup
+ from urllib.parse import urlparse
+ from ddgs import DDGS
++from ddgs.engines import ENGINES
++from ddgs.engines.bing import Bing
+ from contextlib import redirect_stdout, redirect_stderr
+ from typing import Tuple
+ from hle_eval.agent.config import EXTRA_BODY, client, AL_WORKSPACE, ACTIVELOOP_BASE_URL, ACTIVELOOP_HEADERS, TOOLS
+@@ -34,6 +39,277 @@ from hle_eval.agent.utils import (
+ )
+ 
+ 
++# ddgs 9.14.x ships the Bing engine as disabled, although its implementation
++# remains available. Re-register it so the official DDGS call can use Bing.
++ENGINES.setdefault("text", {})["bing"] = Bing
++
++
++def _positive_timeout_from_env(name: str, default: float) -> float:
++    try:
++        timeout = float(os.getenv(name, str(default)))
++    except ValueError:
++        return default
++    return timeout if timeout > 0 else default
++
++
++async def _terminate_async_process(process):
++    if process.returncode is not None:
++        return
++    if os.name != "nt":
++        try:
++            os.killpg(process.pid, signal.SIGKILL)
++        except (OSError, ProcessLookupError):
++            process.kill()
++    else:
++        process.kill()
++    await process.wait()
++
++
++async def _run_ddgs_search(search_query: str, max_results: int, timeout: float):
++    process_kwargs = {"start_new_session": True} if os.name != "nt" else {}
++    process = await asyncio.create_subprocess_exec(
++        sys.executable,
++        "-m",
++        "hle_eval.agent.ddgs_worker",
++        stdin=asyncio.subprocess.PIPE,
++        stdout=asyncio.subprocess.PIPE,
++        stderr=asyncio.subprocess.PIPE,
++        **process_kwargs,
++    )
++    request = json.dumps(
++        {
++            "query": search_query,
++            "max_results": max_results,
++            "timeout": min(10.0, timeout),
++        }
++    ).encode("utf-8")
++    try:
++        stdout, stderr = await asyncio.wait_for(
++            process.communicate(request),
++            timeout=timeout,
++        )
++    except asyncio.TimeoutError:
++        await _terminate_async_process(process)
++        raise
++    except asyncio.CancelledError:
++        await _terminate_async_process(process)
++        raise
++
++    if process.returncode != 0:
++        details = stderr.decode("utf-8", errors="replace").strip()
++        raise RuntimeError(details or f"DDGS worker exited with code {process.returncode}")
++    try:
++        payload = json.loads(stdout.decode("utf-8"))
++    except json.JSONDecodeError as exc:
++        raise RuntimeError("DDGS worker returned invalid JSON") from exc
++    if not payload.get("ok"):
++        raise RuntimeError(payload.get("error") or "DDGS search failed")
++    results = payload.get("results")
++    if not isinstance(results, list):
++        raise RuntimeError("DDGS worker returned a non-list result")
++    return results
++
++
++def get_duplicate_tool_threshold() -> int:
++    """Return the repeat count that disables a tool for the current question."""
++    raw_threshold = os.getenv("HLE_DUPLICATE_TOOL_THRESHOLD", "2")
++    try:
++        return max(1, int(raw_threshold))
++    except ValueError:
++        return 2
++
++
++def get_tool_call_signature(tool_call) -> str:
++    """Build a stable signature from a tool name and normalized JSON arguments."""
++    tool_name = tool_call.function.name
++    raw_arguments = getattr(tool_call.function, "arguments", None) or "{}"
++    try:
++        arguments = json.dumps(
++            json.loads(raw_arguments),
++            sort_keys=True,
++            separators=(",", ":"),
++            ensure_ascii=False,
++        )
++    except (TypeError, json.JSONDecodeError):
++        arguments = raw_arguments.strip()
++    return f"{tool_name}:{arguments}"
++
++
++def get_code_execution_timeout() -> float:
++    """Return the hard wall-clock limit for one code interpreter call."""
++    raw_timeout = os.getenv("HLE_CODE_EXECUTION_TIMEOUT", "60")
++    try:
++        timeout = float(raw_timeout)
++    except ValueError:
++        return 60.0
++    return timeout if timeout > 0 else 60.0
++
++
++def get_code_execution_startup_timeout() -> float:
++    """Return the process startup limit, separate from generated-code runtime."""
++    raw_timeout = os.getenv("HLE_CODE_EXECUTION_STARTUP_TIMEOUT", "120")
++    try:
++        timeout = float(raw_timeout)
++    except ValueError:
++        return 120.0
++    return timeout if timeout > 0 else 120.0
++
++
++def _code_execution_worker_main(connection):
++    """Run generated code in a process whose lifetime the parent controls."""
++    if os.name != "nt":
++        try:
++            os.setsid()
++        except OSError:
++            pass
++
++    _execution_environments.clear()
++    restricted_globals = asyncio.run(
++        _get_execution_environment("__code_execution_worker__")
++    )
++    connection.send(("ready", "", ""))
++
++    try:
++        while True:
++            command, payload = connection.recv()
++            if command == "shutdown":
++                return
++            if command != "execute":
++                connection.send(("error", "", f"Unknown worker command: {command}"))
++                continue
++
++            stdout_capture = io.StringIO()
++            stderr_capture = io.StringIO()
++            try:
++                with redirect_stdout(stdout_capture), redirect_stderr(stderr_capture):
++                    exec(payload, restricted_globals, restricted_globals)
++            except KeyboardInterrupt:
++                stderr_capture.write("KeyboardInterrupt: Code execution was interrupted\n")
++            except SystemExit as exc:
++                stderr_capture.write(f"SystemExit: {str(exc)}\n")
++            except Exception as exc:
++                error_type = type(exc).__name__
++                stderr_capture.write(f"{error_type}: {str(exc)}\n")
++                if isinstance(exc, NameError):
++                    var_name = str(exc).split("'")[1] if "'" in str(exc) else "unknown"
++                    stderr_capture.write(
++                        f"Hint: The variable '{var_name}' is not defined. Ensure it was "
++                        "defined in a previous cell or imported correctly.\n"
++                    )
++                elif isinstance(exc, SyntaxError):
++                    stderr_capture.write(
++                        "Hint: Check for syntax errors like missing colons, unmatched "
++                        "parentheses, or indentation issues.\n"
++                    )
++
++            connection.send(
++                ("ok", stdout_capture.getvalue(), stderr_capture.getvalue())
++            )
++    except (EOFError, BrokenPipeError, OSError):
++        return
++    finally:
++        connection.close()
++
++
++class _CodeExecutionProcess:
++    """Persistent per-question process with a hard-kill timeout."""
++
++    def __init__(self):
++        available_methods = multiprocessing.get_all_start_methods()
++        requested_method = os.getenv("HLE_CODE_EXECUTION_START_METHOD", "spawn")
++        start_method = (
++            requested_method if requested_method in available_methods else "spawn"
++        )
++        self._context = multiprocessing.get_context(start_method)
++        self._connection = None
++        self._process = None
++
++    def _start(self):
++        parent_connection, child_connection = self._context.Pipe()
++        process = self._context.Process(
++            target=_code_execution_worker_main,
++            args=(child_connection,),
++            daemon=True,
++        )
++        self._connection = parent_connection
++        self._process = process
++        process.start()
++        child_connection.close()
++
++        startup_timeout = get_code_execution_startup_timeout()
++        if not self._connection.poll(startup_timeout):
++            self._terminate()
++            raise RuntimeError(
++                f"Code execution process did not start within {startup_timeout} seconds"
++            )
++        status, _, startup_error = self._connection.recv()
++        if status != "ready":
++            self._terminate()
++            raise RuntimeError(startup_error or "Code execution process failed to start")
++
++    def _terminate(self):
++        process = self._process
++        if process is None:
++            return
++
++        if process.is_alive():
++            terminated_group = False
++            if os.name != "nt":
++                try:
++                    if os.getpgid(process.pid) == process.pid:
++                        os.killpg(process.pid, signal.SIGTERM)
++                        terminated_group = True
++                except (OSError, ProcessLookupError):
++                    pass
++            if not terminated_group:
++                process.terminate()
++
++            process.join(timeout=1.0)
++            if process.is_alive():
++                if os.name != "nt":
++                    try:
++                        if os.getpgid(process.pid) == process.pid:
++                            os.killpg(process.pid, signal.SIGKILL)
++                        else:
++                            process.kill()
++                    except (OSError, ProcessLookupError):
++                        process.kill()
++                else:
++                    process.kill()
++                process.join(timeout=1.0)
++
++        process.close()
++        self._process = None
++
++        if self._connection is not None:
++            self._connection.close()
++            self._connection = None
++
++    def execute(self, code: str, timeout: float):
++        try:
++            if self._process is None or not self._process.is_alive():
++                self._terminate()
++                self._start()
++            self._connection.send(("execute", code))
++            if not self._connection.poll(timeout):
++                self._terminate()
++                return "timeout", "", ""
++            status, stdout_output, stderr_output = self._connection.recv()
++            return status, stdout_output, stderr_output
++        except (EOFError, BrokenPipeError, OSError) as exc:
++            self._terminate()
++            return "error", "", f"Code execution process failed: {exc}"
++
++    def close(self):
++        if self._process is not None and self._process.is_alive():
++            try:
++                self._connection.send(("shutdown", None))
++                self._process.join(timeout=1.0)
++            except (BrokenPipeError, EOFError, OSError):
++                pass
++        self._terminate()
++
++
+ # Persistent execution environments per question_id
+ # This dictionary stores the globals environment for each question_id
+ # so that variables, functions, and imports persist across code_interpreter calls
+@@ -44,6 +320,8 @@ _environments_lock = asyncio.Lock()
+ # This prevents concurrent executions from interfering with each other
+ _question_locks = {}
+ _question_locks_lock = asyncio.Lock()
++_code_execution_processes = {}
++_code_execution_processes_lock = asyncio.Lock()
+ 
+ 
+ async def _get_execution_environment(question_id: str = None):
+@@ -89,6 +367,14 @@ async def _get_execution_environment(question_id: str = None):
+                     'range': range,
+                     'enumerate': enumerate,
+                     'zip': zip,
++                    'map': map,
++                    'next': next,
++                    'iter': iter,
++                    'frozenset': frozenset,
++                    'complex': complex,
++                    'divmod': divmod,
++                    'pow': pow,
++                    'repr': repr,
+                     'sum': sum,
+                     'max': max,
+                     'min': min,
+@@ -169,9 +455,22 @@ async def _get_question_lock(question_id: str = None):
+         return _question_locks[env_key]
+ 
+ 
++async def _get_code_execution_process(question_id: str = None):
++    env_key = question_id if question_id else "default"
++    async with _code_execution_processes_lock:
++        if env_key not in _code_execution_processes:
++            _code_execution_processes[env_key] = _CodeExecutionProcess()
++        return _code_execution_processes[env_key]
++
++
+ async def _cleanup_execution_environment(question_id: str = None):
+     """Clean up the execution environment and lock for a question_id."""
+     env_key = question_id if question_id else 'default'
++    async with _code_execution_processes_lock:
++        code_process = _code_execution_processes.pop(env_key, None)
++    if code_process is not None:
++        loop = asyncio.get_running_loop()
++        await loop.run_in_executor(None, code_process.close)
+     async with _environments_lock:
+         if env_key in _execution_environments:
+             del _execution_environments[env_key]
+@@ -180,6 +479,30 @@ async def _cleanup_execution_environment(question_id: str = None):
+             del _question_locks[env_key]
+ 
+ 
++async def cleanup_question_resources(question_id: str = None):
++    """Public cleanup hook for runner-level cancellation and timeout handling."""
++    await _cleanup_execution_environment(question_id)
++
++
++async def cleanup_all_resources():
++    """Stop every code execution process and clear per-question state."""
++    async with _code_execution_processes_lock:
++        code_processes = list(_code_execution_processes.values())
++        _code_execution_processes.clear()
++
++    if code_processes:
++        loop = asyncio.get_running_loop()
++        await asyncio.gather(
++            *(loop.run_in_executor(None, process.close) for process in code_processes),
++            return_exceptions=True,
++        )
++
++    async with _environments_lock:
++        _execution_environments.clear()
++    async with _question_locks_lock:
++        _question_locks.clear()
++
++
+ # Tool implementations
+ async def web_browsing(query: str, max_results: int = 5, question_id: str = None, is_last_tool: bool = False) -> str:
+     """Search the web using DuckDuckGo to find information about a query."""
+@@ -208,15 +531,13 @@ async def web_browsing(query: str, max_results: int = 5, question_id: str = None
+         
+         trace_warning(f"web_browsing: Executing DDGS search with query='{search_query}', max_results={max_results}", question_id)
+         
+-        loop = asyncio.get_event_loop()
+-        def search_ddg():
+-            # Request a few more results to account for filtering
+-            return list(DDGS().text(search_query, max_results=max_results + 3))
+-        
++        loop = asyncio.get_running_loop()
++        search_timeout = _positive_timeout_from_env("HLE_WEB_SEARCH_TIMEOUT", 30.0)
+         try:
+-            raw_results = await asyncio.wait_for(
+-                loop.run_in_executor(None, search_ddg),
+-                timeout=30.0
++            raw_results = await _run_ddgs_search(
++                search_query,
++                max_results=max_results + 3,
++                timeout=search_timeout,
+             )
+         except asyncio.TimeoutError:
+             error_msg = f"Search request timed out for query: '{query}'"
+@@ -261,7 +582,7 @@ async def web_browsing(query: str, max_results: int = 5, question_id: str = None
+             content = r.get('body', 'N/A')
+             try:
+                 def fetch():
+-                    response = requests.get(r['href'], headers=headers, timeout=10)
++                    response = requests.get(r['href'], headers=headers, timeout=8)
+                     soup = BeautifulSoup(response.text, 'html.parser')
+                     # Remove unwanted tags that don't contain useful content
+                     for tag in soup(["script", "style", "nav", "footer"]):
+@@ -326,7 +647,7 @@ async def get_file_metadata(file_id: str, base_url: str = ACTIVELOOP_BASE_URL, h
+     async with aiohttp.ClientSession() as session:
+         headers = dict(headers)
+         # headers["accept"] = "application/json"
+-        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as response:
++        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as response:
+             if response.status == 200:
+                 return await response.json()
+             else:
+@@ -338,7 +659,7 @@ async def get_file(file_id: str, base_url: str = ACTIVELOOP_BASE_URL, headers: d
+     async with aiohttp.ClientSession() as session:
+         headers = dict(headers)
+         # headers["accept"] = "application/json"
+-        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as response:
++        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as response:
+             if response.status == 200:
+                 return await response.content.read()
+             else:
+@@ -346,7 +667,7 @@ async def get_file(file_id: str, base_url: str = ACTIVELOOP_BASE_URL, headers: d
+ 
+ 
+ async def scientific_search(query: str, top_k: int = 10, question_id: str = None, is_last_tool: bool = False) -> str:
+-    """Search within 28M scientific papers using Activeloop API to find relevant research information."""
++    """Search the web for scientific information using the shared DDGS backend."""
+     # Ensure top_k is an integer
+     try:
+         top_k = int(top_k)
+@@ -359,98 +680,62 @@ async def scientific_search(query: str, top_k: int = 10, question_id: str = None
+     start_time = trace_tool_call("scientific_search", {"query": query, "top_k": top_k}, question_id, indent_level=2)
+     
+     try:
+-        url = f"{ACTIVELOOP_BASE_URL}/chat/completions"
+-        
+-        data = {
+-            "model": "activeloop-l1-retrieval",
+-            "workspace": AL_WORKSPACE,
+-            "messages": [
+-                {
+-                    "role": "user",
+-                    "content": [
+-                        {
+-                            "type": "text",
+-                            "text": query,
+-                        },
+-                        {
+-                            "type": "filter",
+-                            "top_k": top_k,
+-                        }
+-                    ]
+-                }
+-            ]
+-        }
+-        
+-        async with aiohttp.ClientSession() as session:
+-            async with session.post(url, headers=ACTIVELOOP_HEADERS, json=data, timeout=aiohttp.ClientTimeout(total=60)) as response:
+-                if response.status != 200:
+-                    error_msg = f"API request failed with status {response.status}: {await response.text()}"
+-                    trace_tool_result("scientific_search", error_msg, success=False, question_id=question_id, indent_level=2, is_last_tool=is_last_tool, start_time=start_time)
+-                    return error_msg
+-                
+-                result = await response.json()
+-
+-        # Save result only if DEBUG_SAVE_RESULTS is set, with unique filename to avoid race conditions
+-        if os.environ.get("DEBUG_SAVE_RESULTS"):
+-            from agent.run_utils import get_run_directory
+-            run_dir = get_run_directory()
+-            if run_dir:
+-                debug_dir = os.path.join(run_dir, "traces")
+-                os.makedirs(debug_dir, exist_ok=True)
+-                filename = os.path.join(debug_dir, f"search_result_{question_id or 'unknown'}_{int(datetime.now().timestamp())}.json")
+-            else:
+-                filename = f"search_result_{question_id or 'unknown'}_{int(datetime.now().timestamp())}.json"
+-            with open(filename, "w") as f:
+-                json.dump(result, f, indent=2)
++        search_query = f"{query} -site:huggingface.co"
++        if query.startswith(('http://', 'https://')):
++            search_query = urlparse(query).netloc
+ 
+-        if 'choices' in result and len(result['choices']) > 0:
++        search_timeout = _positive_timeout_from_env(
++            "HLE_SCIENTIFIC_SEARCH_TIMEOUT",
++            20.0,
++        )
++        raw_results = await _run_ddgs_search(
++            search_query,
++            max_results=top_k + 3,
++            timeout=search_timeout,
++        )
++
++        filtered_results = []
++        result_titles = []
++        for result in raw_results:
++            href = result.get('href', '')
++            title = result.get('title', '').lower()
++            body = result.get('body', '').lower()
++            if "huggingface.co" in href.lower():
++                continue
++            if "humanity's last exam" in title or "hle dataset" in title:
++                continue
++            filtered_results.append(result)
++            result_titles.append(result.get('title', 'N/A'))
++            if len(filtered_results) >= top_k:
++                break
++
++        if not filtered_results:
++            result_text = f"No information found for query: {query}"
++        else:
+             formatted_results = []
+-            result_titles = []
+-            
+-            # Limit individual result content to prevent excessive output
+-            MAX_CONTENT_PER_RESULT = 2000  # Characters per result content
+-            MAX_TOTAL_OUTPUT = 15000  # Total characters for all results combined
+-            
+-            for idx, c in enumerate(result['choices'], 1):
+-                content = c.get('message', {}).get('content', 'N/A')
+-                # Truncate individual content if too long
+-                if len(content) > MAX_CONTENT_PER_RESULT:
+-                    content = content[:MAX_CONTENT_PER_RESULT] + "\n[Content truncated...]"
+-                
+-                metadata = c.get('metadata', {})
+-                file_id = metadata.get('file_id', 'N/A')
+-                chunk_index = metadata.get('chunk_index', 0)
+-                page_number = chunk_index + 1
+-                score = metadata.get('score', 'N/A')
+-                
++            for idx, result in enumerate(filtered_results, 1):
+                 formatted_results.append(
+                     f"Result {idx}:\n"
+-                    f"Content: {content}\n"
+-                    f"File ID: {file_id}\n"
+-                    f"Page Number: {page_number}\n"
+-                    f"Score: {score}\n"
++                    f"Title: {result.get('title', 'N/A')}\n"
++                    f"URL: {result.get('href', 'N/A')}\n"
++                    f"Snippet: {result.get('body', 'N/A')}\n"
+                 )
+-                result_titles.append(f"File {file_id}, Page {page_number}")
+-            
+             result_text = f"Query: {query}\n\n" + "\n---\n\n".join(formatted_results)
+-            
+-            # Truncate overall result if still too long
+-            if len(result_text) > MAX_TOTAL_OUTPUT:
+-                # Try to truncate at a result boundary
+-                truncated = result_text[:MAX_TOTAL_OUTPUT]
+-                last_separator = truncated.rfind("\n---\n\n")
+-                if last_separator > MAX_TOTAL_OUTPUT * 0.7:  # Only use boundary if reasonable
+-                    result_text = truncated[:last_separator] + "\n\n[Results truncated due to length limit...]"
+-                else:
+-                    result_text = truncated + "\n\n[Content truncated due to length limit...]"
+-            
+-            trace_tool_result("scientific_search", f"Retrieved {len(result['choices'])} results", success=True, question_id=question_id, indent_level=2, details=result_titles, is_last_tool=is_last_tool, start_time=start_time)
+-            return result_text
+-        else:
+-            result = f"No results found for query: {query}"
+-            trace_tool_result("scientific_search", result, success=True, question_id=question_id, indent_level=2, is_last_tool=is_last_tool, start_time=start_time)
+-            return result
+-            
++            if len(result_text) > 15000:
++                result_text = result_text[:15000] + "\n[Content truncated due to length limit...]"
++
++        trace_tool_result(
++            "scientific_search",
++            f"Retrieved {len(filtered_results)} results via DDGS Bing" if filtered_results else result_text,
++            success=True,
++            question_id=question_id,
++            indent_level=2,
++            details=result_titles,
++            is_last_tool=is_last_tool,
++            start_time=start_time,
++        )
++        return result_text
++
+     except asyncio.TimeoutError:
+         error_msg = f"Search request timed out for query: '{query}'"
+         trace_tool_result("scientific_search", error_msg, success=False, question_id=question_id, indent_level=2, is_last_tool=is_last_tool, start_time=start_time)
+@@ -606,50 +891,32 @@ async def code_interpreter(code: str, question_id: str = None, is_last_tool: boo
+         with open(code_file_path, "a", encoding="utf-8") as f:
+             f.write(code + "\n\n")
+     
+-    # Timeout for code execution (60 seconds)
+-    CODE_EXECUTION_TIMEOUT = 60.0
++    code_execution_timeout = get_code_execution_timeout()
+     
+     try:
+         question_lock = await _get_question_lock(question_id)
+-        restricted_globals = await _get_execution_environment(question_id)
+         
+         async with question_lock:
+-            loop = asyncio.get_event_loop()
+-            def execute_code():
+-                stdout_capture = io.StringIO()
+-                stderr_capture = io.StringIO()
+-                try:
+-                    with redirect_stdout(stdout_capture), redirect_stderr(stderr_capture):
+-                        # --- KEY CHANGE: STATE PERSISTENCE ---
+-                        # Use restricted_globals for BOTH globals and locals to ensure
+-                        # that variables defined in 'code' persist to the next call.
+-                        exec(code, restricted_globals, restricted_globals)
+-                        # -------------------------------------
+-                except KeyboardInterrupt:
+-                    stderr_capture.write("KeyboardInterrupt: Code execution was interrupted\n")
+-                except SystemExit as e:
+-                    stderr_capture.write(f"SystemExit: {str(e)}\n")
+-                except Exception as e:
+-                    # Enhanced error handling
+-                    error_type = type(e).__name__
+-                    stderr_capture.write(f"{error_type}: {str(e)}\n")
+-                    if isinstance(e, NameError):
+-                        var_name = str(e).split("'")[1] if "'" in str(e) else "unknown"
+-                        stderr_capture.write(f"Hint: The variable '{var_name}' is not defined. Ensure it was defined in a previous cell or imported correctly.\n")
+-                    elif isinstance(e, SyntaxError):
+-                        stderr_capture.write(f"Hint: Check for syntax errors like missing colons, unmatched parentheses, or indentation issues.\n")
+-
+-                return stdout_capture.getvalue(), stderr_capture.getvalue()
+-            
+-            try:
+-                stdout_output, stderr_output = await asyncio.wait_for(
+-                    loop.run_in_executor(None, execute_code),
+-                    timeout=CODE_EXECUTION_TIMEOUT
++            code_process = await _get_code_execution_process(question_id)
++            loop = asyncio.get_running_loop()
++            status, stdout_output, stderr_output = await loop.run_in_executor(
++                None,
++                code_process.execute,
++                code,
++                code_execution_timeout,
++            )
++            if status == "timeout":
++                error_msg = (
++                    f"Error: Code execution timed out after {code_execution_timeout} "
++                    "seconds. The execution process was killed and this question's "
++                    "code state was reset."
+                 )
+-            except asyncio.TimeoutError:
+-                error_msg = f"Error: Code execution timed out after {CODE_EXECUTION_TIMEOUT} seconds. The code may be taking too long or stuck in an infinite loop."
+                 trace_tool_result("code_interpreter", error_msg, success=False, question_id=question_id, indent_level=2, is_last_tool=is_last_tool, start_time=start_time)
+                 return error_msg
++            if status != "ok":
++                error_msg = stderr_output or "Code execution process failed unexpectedly."
++                trace_tool_result("code_interpreter", error_msg, success=False, question_id=question_id, indent_level=2, is_last_tool=is_last_tool, start_time=start_time)
++                return f"Error: {error_msg}"
+             
+             if stderr_output:
+                 result = f"Error: {stderr_output}\nOutput: {stdout_output}"
+@@ -699,7 +966,7 @@ def get_model_name(args, question_id: str):
+     return args.model
+ 
+ 
+-def configure_tools_for_iteration(iteration: int, max_iterations: int, messages: list):
++def configure_tools_for_iteration(iteration: int, max_iterations: int, messages: list, disabled_tools: set = None):
+     """Configure tools and tool_choice based on current iteration.
+     
+     Strategy:
+@@ -710,27 +977,35 @@ def configure_tools_for_iteration(iteration: int, max_iterations: int, messages:
+     while preventing it from gathering new information in the final step.
+     Note: The final forced answer call (after loop) disables all tools via make_final_answer_call.
+     """
++    disabled_tools = disabled_tools or set()
++    available_tools = [
++        tool for tool in TOOLS
++        if tool['function']['name'] not in disabled_tools
++    ]
++
+     if iteration >= max_iterations - 1:
+         # Last iteration in loop: Allow only code_interpreter for calculations/verification
+         # Disable retrieval tools (web_browsing, scientific_search) to stop gathering info
+-        tools_available = [t for t in TOOLS if t['function']['name'] == 'code_interpreter']
+-        tool_choice = "auto"
++        tools_available = [t for t in available_tools if t['function']['name'] == 'code_interpreter']
++        tool_choice = "auto" if tools_available else None
+         messages.append({
+             "role": "user",
+-            "content": f"CRITICAL: This is iteration {iteration}/{max_iterations} (final iteration). Retrieval tools (web search, scientific search) are DISABLED. You can only use code_interpreter for final calculations or verification. You MUST provide your final answer NOW. Use code_interpreter ONLY if you need to verify or calculate your final answer, then provide your answer as text."
++            "content": f"CRITICAL: This is iteration {iteration}/{max_iterations} (final iteration). Retrieval tools (web search, scientific search) are DISABLED. "
++                       f"{'You can only use code_interpreter for final calculations or verification. ' if tools_available else 'All tools are disabled. '}"
++                       "You MUST provide your final answer NOW."
+         })
+     elif iteration >= max_iterations - 2:
+         # Second-to-last iteration: Strong warning, all tools still available but discouraged
+-        tools_available = TOOLS
+-        tool_choice = "auto"
++        tools_available = available_tools
++        tool_choice = "auto" if tools_available else None
+         messages.append({
+             "role": "user",
+             "content": f"WARNING: This is iteration {iteration}/{max_iterations}. You have only {max_iterations - iteration} iterations left. Use tools ONLY if absolutely necessary, and ALWAYS provide reasoning and your best answer. If you use tools, you MUST also provide text content explaining why."
+         })
+     else:
+         # Normal operation: All tools available
+-        tools_available = TOOLS
+-        tool_choice = "auto"
++        tools_available = available_tools
++        tool_choice = "auto" if tools_available else None
+     
+     return tools_available, tool_choice
+ 
+@@ -1011,17 +1286,24 @@ def check_and_break_tool_loop(consecutive_tool_only_iterations: int, iteration:
+ async def handle_tool_calls(message, messages: list, question_id: str, iteration: int, max_iterations: int,
+                            recent_tool_calls: list, message_content: str, api_start_time: int,
+                            iteration_start_time: int, reasoning: str, total_tokens: dict, tool_outputs_hash: set = None,
+-                           tool_calls_history: set = None):
++                           tool_calls_history: set = None, duplicate_tool_counts: dict = None,
++                           disabled_tools: set = None, duplicate_tool_threshold: int = 2):
+     """Handle tool calls: execute tools and detect loops. Returns 1 if tool-only iteration, 0 otherwise."""
+     if tool_outputs_hash is None:
+         tool_outputs_hash = set()
+     
+     if tool_calls_history is None:
+         tool_calls_history = set()
++
++    if duplicate_tool_counts is None:
++        duplicate_tool_counts = {}
++
++    if disabled_tools is None:
++        disabled_tools = set()
+     
+     tool_count = len(message.tool_calls)
+-    current_tool_names = [tc.function.name for tc in message.tool_calls]
+-    recent_tool_calls.append(current_tool_names)
++    current_tool_signatures = [get_tool_call_signature(tc) for tc in message.tool_calls]
++    recent_tool_calls.append(current_tool_signatures)
+     # Keep only last 3 iterations
+     if len(recent_tool_calls) > 3:
+         recent_tool_calls.pop(0)
+@@ -1046,15 +1328,38 @@ async def handle_tool_calls(message, messages: list, question_id: str, iteration
+     for idx, tool_call in enumerate(message.tool_calls):
+         # Create a hash of function name AND arguments to detect exact duplicates
+         # e.g., web_browsing("Piet programming language") called twice
+-        call_signature = f"{tool_call.function.name}:{tool_call.function.arguments}"
++        tool_name = tool_call.function.name
++        call_signature = get_tool_call_signature(tool_call)
+         
+         if call_signature in tool_calls_history:
+-            trace_warning(f"Duplicate tool call detected: {call_signature}", question_id)
++            repeat_count = duplicate_tool_counts.get(call_signature, 0) + 1
++            duplicate_tool_counts[call_signature] = repeat_count
++            trace_warning(
++                f"Duplicate tool call detected ({repeat_count}/{duplicate_tool_threshold} repeats): {call_signature}",
++                question_id,
++            )
+             messages.append({
+                 "role": "tool",
+                 "tool_call_id": tool_call.id,
+-                "content": "SYSTEM ERROR: You have already called this tool with these exact arguments. Do not repeat actions. Proceed to the next step or provide your final answer."
++                "content": (
++                    "SYSTEM ERROR: You have already called this tool with these exact arguments. "
++                    "Do not repeat actions. Proceed to the next step or provide your final answer."
++                )
+             })
++            if repeat_count >= duplicate_tool_threshold and tool_name not in disabled_tools:
++                disabled_tools.add(tool_name)
++                trace_warning(
++                    f"Disabling tool '{tool_name}' after {repeat_count} identical repeats.",
++                    question_id,
++                )
++                messages.append({
++                    "role": "user",
++                    "content": (
++                        f"The tool {tool_name} has been disabled after repeated identical calls. "
++                        "Provide your final answer using the information already available, "
++                        "or use a different available tool. Do not call the disabled tool again."
++                    ),
++                })
+             continue  # Skip execution of duplicate
+         
+         tool_calls_history.add(call_signature)
+@@ -1083,11 +1388,14 @@ async def handle_tool_calls(message, messages: list, question_id: str, iteration
+     # Detect repetitive tool call patterns
+     if len(recent_tool_calls) >= 2:
+         if recent_tool_calls[-1] == recent_tool_calls[-2]:
+-            trace_warning(f"Potential tool call loop detected: same tools called in consecutive iterations: {current_tool_names}", question_id)
++            trace_warning(
++                f"Potential tool call loop detected: same tool calls with the same arguments were repeated: {current_tool_signatures}",
++                question_id,
++            )
+             if iteration >= max_iterations - 2:
+                 messages.append({
+                     "role": "user",
+-                    "content": f"CRITICAL: You just called the same tools ({current_tool_names}) as in the previous iteration. This is iteration {iteration}/{max_iterations}. You MUST stop and provide your answer NOW based on the information you have."
++                    "content": f"CRITICAL: You just repeated the same tool calls ({current_tool_signatures}) as in the previous iteration. This is iteration {iteration}/{max_iterations}. You MUST stop and provide your answer NOW based on the information you have."
+                 })
+     
+     # print(f"  {_colorize('└─', Colors.BRIGHT_BLUE)}\n")
+@@ -1137,8 +1445,8 @@ async def make_final_answer_call(messages, args, max_iterations: int, question_i
+             temperature=args.temperature,
+             max_completion_tokens=args.max_completion_tokens,
+             messages=messages,
+-            tools=[],  # No tools available
+-            tool_choice="none",  # Force no tool calls
++            # Omit tools/tool_choice entirely: some OpenAI-compatible APIs
++            # reject an explicit empty tools array during the final call.
+             stream=False,
+             extra_body=EXTRA_BODY
+         )
+@@ -1255,6 +1563,13 @@ async def attempt_question(question, args, max_iterations: int = 15):
+     consecutive_tool_only_iterations = 0
+     tool_outputs_hash = set()  # Track tool output content to detect repeated outputs
+     tool_calls_history = set()  # Track tool call signatures (function name + arguments) to detect exact duplicates
++    duplicate_tool_counts = {}
++    disabled_tools = set()
++    duplicate_tool_threshold = get_duplicate_tool_threshold()
++    trace_warning(
++        f"Exact duplicate tool calls will disable the offending tool after {duplicate_tool_threshold} repeats.",
++        question_id,
++    )
+     
+     try:
+         while iteration < max_iterations:
+@@ -1266,19 +1581,23 @@ async def attempt_question(question, args, max_iterations: int = 15):
+             # Get model name and configure tools
+             model_name = get_model_name(args, question_id)
+             api_start_time = trace_api_call(model_name, iteration, question_id, messages=messages)
+-            tools_available, tool_choice = configure_tools_for_iteration(iteration, max_iterations, messages)
++            tools_available, tool_choice = configure_tools_for_iteration(
++                iteration, max_iterations, messages, disabled_tools
++            )
+             
+             # Make API call
+-            response = await client.chat.completions.create(
+-                model=model_name,
+-                temperature=args.temperature,
+-                max_completion_tokens=args.max_completion_tokens,
+-                messages=messages,
+-                tools=tools_available,
+-                tool_choice=tool_choice,
+-                stream=False,
+-                extra_body=EXTRA_BODY
+-            )
++            request_kwargs = {
++                "model": model_name,
++                "temperature": args.temperature,
++                "max_completion_tokens": args.max_completion_tokens,
++                "messages": messages,
++                "stream": False,
++                "extra_body": EXTRA_BODY,
++            }
++            if tools_available:
++                request_kwargs["tools"] = tools_available
++                request_kwargs["tool_choice"] = tool_choice
++            response = await client.chat.completions.create(**request_kwargs)
+             
+             message = response.choices[0].message
+             message_content, reasoning, reasoning_field_name = extract_content_and_reasoning(message)
+@@ -1310,11 +1629,15 @@ async def attempt_question(question, args, max_iterations: int = 15):
+                     consecutive_tool_only_iterations = 0
+                 
+                 # Check and break tool loop if needed
++                has_exact_duplicate = any(
++                    get_tool_call_signature(tool_call) in tool_calls_history
++                    for tool_call in message.tool_calls
++                )
+                 if check_and_break_tool_loop(
+                     consecutive_tool_only_iterations, iteration, max_iterations,
+                     message, message_content, messages, question_id,
+                     api_start_time, iteration_start_time, reasoning, total_tokens
+-                ):
++                ) and not has_exact_duplicate:
+                     continue
+                 
+                 # Handle tool calls
+@@ -1322,7 +1645,8 @@ async def attempt_question(question, args, max_iterations: int = 15):
+                     message, messages, question_id, iteration, max_iterations,
+                     recent_tool_calls, message_content, api_start_time,
+                     iteration_start_time, reasoning, total_tokens, tool_outputs_hash,
+-                    tool_calls_history
++                    tool_calls_history, duplicate_tool_counts, disabled_tools,
++                    duplicate_tool_threshold
+                 )
+                 continue
+             
+@@ -1544,4 +1868,4 @@ print("Objective value =", pulp.value(problem.objective))
+         f.write(result)
+     exit()
+ 
+-    print(result)
+\ No newline at end of file
++    print(result)
+diff --git a/hle_eval/run_agent_predictions.py b/hle_eval/run_agent_predictions.py
+index ec2dc95..3ec5267 100644
+--- a/hle_eval/run_agent_predictions.py
++++ b/hle_eval/run_agent_predictions.py
+@@ -15,6 +15,10 @@ import os
+ import json
+ import argparse
+ import asyncio
++import tempfile
++import time
++from datetime import datetime, timezone
++from pathlib import Path
+ from datasets import load_dataset
+ from openai import AsyncOpenAI
+ from tqdm.asyncio import tqdm_asyncio
+@@ -24,47 +28,340 @@ from hle_eval.agent.config import client
+ from hle_eval.agent.config import EXTRA_BODY
+ from hle_eval.agent.run_utils import set_run_directory, get_predictions_path, get_judged_predictions_path
+ from hle_eval.agent.tools import attempt_question as agent_attempt_question
++from hle_eval.agent.tools import cleanup_question_resources
+ 
+ 
+-async def attempt_all(questions, args, predictions, temp_filepath):
++def env_bool(name: str, default: bool = False) -> bool:
++    value = os.getenv(name)
++    if value is None or value == "":
++        return default
++    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
++
++
++def load_hle_dataset(dataset_arg: str):
++    dataset_path = Path(dataset_arg)
++    if dataset_arg == "impossible":
++        from impossible import get_dataset
++        return get_dataset().to_dict()
++    if dataset_path.exists():
++        suffix = dataset_path.suffix.lower()
++        if suffix == ".parquet":
++            return load_dataset("parquet", data_files=str(dataset_path), split="train").to_dict()
++        if suffix in {".json", ".jsonl"}:
++            return load_dataset("json", data_files=str(dataset_path), split="train").to_dict()
++        raise ValueError(f"Unsupported local HLE dataset file: {dataset_path}")
++    return load_dataset(dataset_arg, split="test").to_dict()
++
++
++def is_text_only_question(question: dict) -> bool:
++    for key in ("image", "image_preview", "rationale_image"):
++        value = question.get(key)
++        if value not in (None, "", [], {}):
++            return False
++    return True
++
++
++def utc_now():
++    return datetime.now(timezone.utc).isoformat()
++
++
++def atomic_write_json(path, payload):
++    path = Path(path)
++    path.parent.mkdir(parents=True, exist_ok=True)
++    fd, writing_name = tempfile.mkstemp(
++        prefix=path.name + ".", suffix=".writing", dir=path.parent
++    )
++    writing_path = Path(writing_name)
++    try:
++        with os.fdopen(fd, "w", encoding="utf-8") as handle:
++            json.dump(payload, handle, indent=2)
++        for attempt in range(10):
++            try:
++                os.replace(writing_path, path)
++                break
++            except PermissionError:
++                if attempt == 9:
++                    raise
++                time.sleep(0.2)
++    finally:
++        try:
++            writing_path.unlink()
++        except FileNotFoundError:
++            pass
++
++
++def recorded_failure_ids(progress_path):
++    try:
++        payload = json.loads(Path(progress_path).read_text(encoding="utf-8"))
++    except (OSError, json.JSONDecodeError):
++        return set()
++    if not isinstance(payload, dict):
++        return set()
++    failed = payload.get("failed_ids") if isinstance(payload.get("failed_ids"), list) else []
++    timed_out = payload.get("timed_out_ids") if isinstance(payload.get("timed_out_ids"), list) else []
++    return {str(question_id) for question_id in [*failed, *timed_out]}
++
++
++def make_incorrect_prediction(question, model, error_type, message, status):
++    """Create a terminal prediction that the judge can count as incorrect."""
++    return {
++        "model": model,
++        "response": "",
++        "usage": {
++            "prompt_tokens": 0,
++            "completion_tokens": 0,
++            "total_tokens": 0,
++        },
++        "termination_reason": "infrastructure_error",
++        "error": {
++            "error_type": error_type,
++            "message": message,
++            "status": status,
++        },
++        "judge_response": {
++            "correct_answer": question.get("answer"),
++            "model_answer": "None",
++            "reasoning": message,
++            "correct": "no",
++            "confidence": 100,
++        },
++    }
++
++
++def backfill_incorrect_predictions(
++    questions,
++    predictions,
++    *,
++    model,
++    progress_path,
++    explicit_ids=None,
++):
++    """Materialize prior terminal failures so they remain in the score denominator."""
++    question_by_id = {str(question["id"]): question for question in questions}
++    try:
++        progress = json.loads(Path(progress_path).read_text(encoding="utf-8"))
++    except (OSError, json.JSONDecodeError):
++        progress = {}
++    if not isinstance(progress, dict):
++        progress = {}
++
++    failure_specs = {}
++    for question_id in progress.get("timed_out_ids", []):
++        failure_specs[str(question_id)] = (
++            "QuestionTimeout",
++            "Question exceeded the configured wall-clock timeout and was marked incorrect.",
++            "timed_out",
++        )
++    for question_id in progress.get("failed_ids", []):
++        failure_specs.setdefault(
++            str(question_id),
++            (
++                "AgentAttemptFailed",
++                "Question failed without producing a prediction and was marked incorrect.",
++                "failed",
++            ),
++        )
++    for question_id in explicit_ids or set():
++        failure_specs[str(question_id)] = (
++            "HistoricalStuckQuestion",
++            "Question was previously stuck and was explicitly marked incorrect.",
++            "failed",
++        )
++
++    added = set()
++    for question_id, (error_type, message, status) in failure_specs.items():
++        if question_id in predictions or question_id not in question_by_id:
++            continue
++        predictions[question_id] = make_incorrect_prediction(
++            question_by_id[question_id], model, error_type, message, status
++        )
++        added.add(question_id)
++    return added
++
++
++def pending_questions(questions, predictions, excluded_ids=None):
++    completed_ids = {str(question_id) for question_id in predictions}
++    excluded_ids = {str(question_id) for question_id in (excluded_ids or set())}
++    normalized = []
++    for question in questions:
++        item = dict(question)
++        item["id"] = str(item["id"])
++        if item["id"] not in completed_ids and item["id"] not in excluded_ids:
++            normalized.append(item)
++    return normalized
++
++
++async def attempt_all(questions, args, predictions, temp_filepath, skipped_ids=None):
+     semaphore = asyncio.Semaphore(args.num_workers)
+     write_lock = asyncio.Lock()
++    state_lock = asyncio.Lock()
++    progress_path = Path(temp_filepath).with_name("progress_state.json")
++    active_ids = set()
++    failed_ids = []
++    timed_out_ids = []
++    for question_id, prediction in predictions.items():
++        error = prediction.get("error") if isinstance(prediction, dict) else None
++        if not isinstance(error, dict):
++            continue
++        if error.get("status") == "timed_out":
++            timed_out_ids.append(str(question_id))
++        elif prediction.get("termination_reason") == "infrastructure_error":
++            failed_ids.append(str(question_id))
++    initial_record_count = len(predictions)
++    initial_completed = initial_record_count - len(failed_ids) - len(timed_out_ids)
++    successful_this_run = 0
++    skipped_ids = {str(question_id) for question_id in (skipped_ids or set())}
++
++    def progress_payload():
++        finished_this_run = successful_this_run + len(failed_ids) + len(timed_out_ids)
++        return {
++            "total": initial_record_count + len(questions) + len(skipped_ids),
++            "initial_completed": initial_completed,
++            "completed": initial_completed + successful_this_run,
++            "running": len(active_ids),
++            "failed": len(failed_ids),
++            "timed_out": len(timed_out_ids),
++            "pending": max(0, len(questions) - finished_this_run - len(active_ids)),
++            "skipped": len(skipped_ids),
++            "skipped_ids": sorted(skipped_ids),
++            "active_ids": sorted(active_ids),
++            "failed_ids": failed_ids,
++            "timed_out_ids": timed_out_ids,
++            "updated_at": utc_now(),
++        }
++
++    async def update_progress(question_id=None, status=None):
++        nonlocal successful_this_run
++        async with state_lock:
++            if question_id is not None:
++                active_ids.discard(question_id)
++                if status == "running":
++                    active_ids.add(question_id)
++                elif status == "completed":
++                    successful_this_run += 1
++                elif status == "failed":
++                    failed_ids.append(question_id)
++                elif status == "timed_out":
++                    timed_out_ids.append(question_id)
++            atomic_write_json(progress_path, progress_payload())
++
++    await update_progress()
++
++    async def store_prediction(question_id, prediction):
++        async with write_lock:
++            predictions[str(question_id)] = prediction
++            atomic_write_json(temp_filepath, predictions)
+     
+     async def bound_func(question):
+         async with semaphore:
+-            # Use the agent code which includes tracing
+-            result = await agent_attempt_question(question, args, max_iterations=getattr(args, 'max_iterations', 15))
++            question_id = str(question["id"])
++            await update_progress(question_id, "running")
++            timeout_seconds = float(getattr(args, "question_timeout_seconds", 0) or 0)
++            try:
++                attempt = agent_attempt_question(
++                    question,
++                    args,
++                    max_iterations=getattr(args, 'max_iterations', 15),
++                )
++                if timeout_seconds > 0:
++                    result = await asyncio.wait_for(attempt, timeout=timeout_seconds)
++                else:
++                    result = await attempt
++            except asyncio.TimeoutError:
++                message = (
++                    f"Question exceeded the {timeout_seconds}-second wall-clock timeout "
++                    "and was marked incorrect."
++                )
++                print(
++                    f"Question {question_id} timed out after {timeout_seconds} seconds; skipping.",
++                    file=sys.stderr,
++                    flush=True,
++                )
++                await cleanup_question_resources(question_id)
++                await store_prediction(
++                    question_id,
++                    make_incorrect_prediction(
++                        question,
++                        args.model,
++                        "QuestionTimeout",
++                        message,
++                        "timed_out",
++                    ),
++                )
++                await update_progress(question_id, "timed_out")
++                return None
++            except Exception as exc:
++                message = (
++                    f"Question failed with {type(exc).__name__}: {exc}. "
++                    "It was marked incorrect."
++                )
++                print(
++                    f"Question {question_id} failed with {type(exc).__name__}: {exc}",
++                    file=sys.stderr,
++                    flush=True,
++                )
++                await cleanup_question_resources(question_id)
++                await store_prediction(
++                    question_id,
++                    make_incorrect_prediction(
++                        question,
++                        args.model,
++                        type(exc).__name__,
++                        message,
++                        "failed",
++                    ),
++                )
++                await update_progress(question_id, "failed")
++                return None
+             
+             # Write to temp file incrementally as results come in
+             if result is not None:
+                 unique_id, response, usage = result
+-                async with write_lock:
+-                    predictions[unique_id] = {
++                await store_prediction(
++                    unique_id,
++                    {
+                         "model": args.model,
+                         "response": response,
+-                        "usage": usage
+-                    }
+-                    # Save intermediate results to temp file in case of program failure
+-                    os.makedirs(os.path.dirname(temp_filepath), exist_ok=True)
+-                    try:
+-                        # Use atomic write: write to temp file, then rename
+-                        temp_write_path = temp_filepath + ".writing"
+-                        with open(temp_write_path, "w") as f:
+-                            json.dump(predictions, f, indent=4)
+-                        # Atomic rename (works on Unix/Linux)
+-                        os.replace(temp_write_path, temp_filepath)
+-                    except Exception as e:
+-                        # If write fails, log but don't crash
+-                        import traceback
+-                        print(f"Warning: Failed to write temp file: {e}")
+-                        traceback.print_exc()
+-            
++                        "usage": usage,
++                    },
++                )
++                await update_progress(question_id, "completed")
++            else:
++                await store_prediction(
++                    question_id,
++                    make_incorrect_prediction(
++                        question,
++                        args.model,
++                        "AgentAttemptFailed",
++                        "Agent returned no prediction and was marked incorrect.",
++                        "failed",
++                    ),
++                )
++                await update_progress(question_id, "failed")
++
+             return result
+             
+     tasks = [bound_func(q) for q in questions]
+     results = await tqdm_asyncio.gather(*tasks)
+     return results
+ 
++
++def expand_rollouts(questions, num_rollouts: int):
++    """Give each repeated rollout a unique id so traces and predictions do not overwrite."""
++    if num_rollouts == 1:
++        return questions
++
++    expanded = []
++    for question in questions:
++        source_id = str(question["id"])
++        for rollout_index in range(num_rollouts):
++            rollout_question = dict(question)
++            rollout_question["id"] = f"{source_id}__rollout_{rollout_index}"
++            rollout_question["_source_id"] = source_id
++            rollout_question["_rollout_index"] = rollout_index
++            expanded.append(rollout_question)
++    return expanded
++
+     
+ def filter_none_and_incorrect_questions(questions, judged_path, model_id):
+     """
+@@ -100,20 +397,29 @@ def filter_none_and_incorrect_questions(questions, judged_path, model_id):
+ def main(args):
+     assert args.num_workers > 1, "num_workers must be 2 or greater"
+ 
+-    if args.dataset == "impossible":
+-        from impossible import get_dataset
+-        dataset = get_dataset().to_dict()
+-    else:    
+-        dataset = load_dataset(args.dataset, split="test").to_dict() 
++    args.system_prompt_addendum = None
++    if args.system_prompt_file:
++        prompt_path = Path(args.system_prompt_file).expanduser()
++        try:
++            args.system_prompt_addendum = prompt_path.read_text(encoding="utf-8").strip()
++        except OSError as exc:
++            raise ValueError(f"Could not read system prompt file {prompt_path}: {exc}") from exc
++        if not args.system_prompt_addendum:
++            raise ValueError(f"System prompt file is empty: {prompt_path}")
++
++    dataset = load_hle_dataset(args.dataset)
+     dataset = {k: v for k, v in dataset.items()}
+ 
+     # convert to list of json for async parallelism
+     questions = [dict(zip(dataset.keys(), values)) for values in zip(*dataset.values())]
++
++    if env_bool("HLE_WITH_TOOLS_TEXT_ONLY", True):
++        questions = [q for q in questions if is_text_only_question(q)]
+     
+     # If max_samples is set, limit the number of questions
+     if args.max_samples:
+         questions = questions[:args.max_samples]
+-    # INSERT_YOUR_CODE
++    questions = expand_rollouts(questions, args.num_rollouts)
+     
+ 
+     
+@@ -146,7 +452,6 @@ def main(args):
+                     predictions = json.loads(content)
+                 else:
+                     print(f"Warning: {output_filepath} is empty, starting fresh")
+-            questions = [q for q in questions if q["id"] not in predictions]
+         except json.JSONDecodeError as e:
+             print(f"Warning: Failed to parse {output_filepath}: {e}. Starting fresh.")
+             predictions = {}
+@@ -159,20 +464,42 @@ def main(args):
+                     predictions = json.loads(content)
+                 else:
+                     print(f"Warning: {temp_filepath} is empty, starting fresh")
+-            questions = [q for q in questions if q["id"] not in predictions]
+         except json.JSONDecodeError as e:
+             print(f"Warning: Failed to parse {temp_filepath}: {e}. Starting fresh.")
+             predictions = {}
+     else:
+         predictions = {}
+ 
++    progress_path = Path(temp_filepath).with_name("progress_state.json")
++    explicit_incorrect_ids = {
++        value.strip()
++        for value in (args.mark_incorrect_ids or "").split(",")
++        if value.strip()
++    }
++    backfill_incorrect_predictions(
++        questions,
++        predictions,
++        model=args.model,
++        progress_path=progress_path,
++        explicit_ids=explicit_incorrect_ids,
++    )
++
++    skipped_ids = set()
++    if args.skip_failed_on_resume:
++        dataset_ids = {str(question["id"]) for question in questions}
++        completed_ids = {str(question_id) for question_id in predictions}
++        skipped_ids = recorded_failure_ids(progress_path) & dataset_ids - completed_ids
++    questions = pending_questions(questions, predictions, skipped_ids)
++
+     # Initialize temp file with current predictions (for recovery)
+     os.makedirs(os.path.dirname(temp_filepath), exist_ok=True)
+     with open(temp_filepath, "w") as f:
+         json.dump(predictions, f, indent=4)
+ 
+     try:
+-        results = asyncio.run(attempt_all(questions, args, predictions, temp_filepath))
++        results = asyncio.run(
++            attempt_all(questions, args, predictions, temp_filepath, skipped_ids)
++        )
+ 
+         # Process any remaining None results (API call failures)
+         # Note: Successful results are already written incrementally in attempt_all
+@@ -181,6 +508,7 @@ def main(args):
+                 continue
+             # Already processed in attempt_all, but ensure it's in predictions
+             unique_id, response, usage = result
++            unique_id = str(unique_id)
+             if unique_id not in predictions:
+                 predictions[unique_id] = {
+                     "model": args.model,
+@@ -233,6 +561,30 @@ if __name__ == "__main__":
+     parser.add_argument("--temperature", type=float, default=0.0, help="Temperature for sampling.")
+     parser.add_argument("--num_workers", type=int, default=10, help="Async semaphore size. This depends on your rate limit.")
+     parser.add_argument("--max_samples", type=int, default=None, help="Limit evaluation to first N samples")
++    parser.add_argument("--num_rollouts", type=int, default=1, help="Independent model rollouts per dataset example (default: 1)")
+     parser.add_argument("--max_iterations", type=int, default=15, help="Maximum iterations for agent (default: 15)")
++    parser.add_argument(
++        "--question_timeout_seconds",
++        type=float,
++        default=float(os.getenv("HLE_QUESTION_TIMEOUT_SECONDS", "1800")),
++        help="Hard wall-clock limit for one full question trajectory (0 disables).",
++    )
++    parser.add_argument(
++        "--skip_failed_on_resume",
++        action="store_true",
++        help="Skip IDs recorded as failed or timed out in progress_state.json.",
++    )
++    parser.add_argument(
++        "--mark_incorrect_ids",
++        default=os.getenv("HLE_MARK_INCORRECT_IDS", ""),
++        help="Comma-separated question IDs to record as incorrect without running them.",
++    )
++    parser.add_argument(
++        "--system_prompt_file",
++        default=os.getenv("HLE_SYSTEM_PROMPT_FILE"),
++        help="UTF-8 text appended to the HLE system message before each question.",
++    )
+     args = parser.parse_args()
++    if args.num_rollouts < 1:
++        parser.error("--num_rollouts must be at least 1")
+     main(args)
+diff --git a/pyproject.toml b/pyproject.toml
+index 4464ca3..e08b7c7 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -17,7 +17,7 @@ dependencies = [
+     "chess>=1.11.2",
+     "cypari2>=2.2.4",
+     "datasets==3.2.0",
+-    "ddgs>=1.0.0",
++    "ddgs==9.14.4",
+     "dotenv>=0.9.9",
+     "matplotlib>=3.10.7",
+     "networkx>=3.5",
+diff --git a/tests/test_code_interpreter_timeout.py b/tests/test_code_interpreter_timeout.py
+new file mode 100644
+index 0000000..a4d9323
+--- /dev/null
++++ b/tests/test_code_interpreter_timeout.py
+@@ -0,0 +1,93 @@
++import asyncio
++import os
++import tempfile
++import time
++import unittest
++from pathlib import Path
++from unittest import mock
++
++os.environ.setdefault("OPENAI_API_KEY", "test-key")
++
++from hle_eval.agent import tools
++
++
++class CodeInterpreterTimeoutTests(unittest.TestCase):
++    def tearDown(self):
++        asyncio.run(tools._cleanup_execution_environment("hard-timeout-test"))
++        asyncio.run(tools._cleanup_execution_environment("state-test"))
++        asyncio.run(tools._cleanup_execution_environment("cleanup-test"))
++
++    def test_timeout_stops_code_before_later_side_effect(self):
++        with tempfile.TemporaryDirectory() as temp_dir:
++            marker = Path(temp_dir) / "should_not_exist.txt"
++            code = (
++                "import time\n"
++                "from pathlib import Path\n"
++                "time.sleep(0.30)\n"
++                f"Path({str(marker)!r}).write_text('still running', encoding='utf-8')\n"
++            )
++
++            original_wait_for = asyncio.wait_for
++
++            async def wait_for_with_short_timeout(awaitable, timeout):
++                return await original_wait_for(awaitable, timeout=0.05)
++
++            with mock.patch.dict(os.environ, {"HLE_CODE_EXECUTION_TIMEOUT": "0.05"}), mock.patch.object(
++                tools.asyncio,
++                "wait_for",
++                side_effect=wait_for_with_short_timeout,
++            ), mock.patch(
++                "hle_eval.agent.run_utils.get_run_directory",
++                return_value=temp_dir,
++            ):
++                result = asyncio.run(
++                    tools.code_interpreter(code, question_id="hard-timeout-test")
++                )
++
++            self.assertIn("timed out", result.lower())
++            time.sleep(0.40)
++            self.assertFalse(
++                marker.exists(),
++                "timed-out generated code continued running in the background",
++            )
++
++    def test_successful_calls_keep_question_state(self):
++        with tempfile.TemporaryDirectory() as temp_dir:
++            with mock.patch.dict(os.environ, {"HLE_CODE_EXECUTION_TIMEOUT": "2"}), mock.patch(
++                "hle_eval.agent.run_utils.get_run_directory",
++                return_value=temp_dir,
++            ):
++                first = asyncio.run(
++                    tools.code_interpreter("saved_value = 41", question_id="state-test")
++                )
++                second = asyncio.run(
++                    tools.code_interpreter("print(saved_value + 1)", question_id="state-test")
++                )
++
++        self.assertIn("successfully", first.lower())
++        self.assertEqual(second.strip(), "42")
++
++    def test_cleanup_all_resources_stops_code_processes(self):
++        cleanup = getattr(tools, "cleanup_all_resources", None)
++        self.assertIsNotNone(cleanup, "runner cleanup hook is missing")
++        if cleanup is None:
++            return
++
++        with tempfile.TemporaryDirectory() as temp_dir:
++            with mock.patch.dict(os.environ, {"HLE_CODE_EXECUTION_TIMEOUT": "2"}), mock.patch(
++                "hle_eval.agent.run_utils.get_run_directory",
++                return_value=temp_dir,
++            ):
++                asyncio.run(
++                    tools.code_interpreter("print('ready')", question_id="cleanup-test")
++                )
++
++        code_process = tools._code_execution_processes["cleanup-test"]
++        self.assertTrue(code_process._process.is_alive())
++        asyncio.run(cleanup())
++        self.assertIsNone(code_process._process)
++        self.assertEqual(tools._code_execution_processes, {})
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/test_question_timeout_progress.py b/tests/test_question_timeout_progress.py
+new file mode 100644
+index 0000000..8f45578
+--- /dev/null
++++ b/tests/test_question_timeout_progress.py
+@@ -0,0 +1,114 @@
++import asyncio
++import json
++import os
++import tempfile
++import unittest
++from pathlib import Path
++from types import SimpleNamespace
++from unittest.mock import patch
++
++os.environ.setdefault("OPENAI_API_KEY", "test-key")
++
++from hle_eval import run_agent_predictions
++
++
++class QuestionTimeoutProgressTests(unittest.TestCase):
++    def test_completed_numeric_question_id_is_filtered_after_json_resume(self):
++        questions = [{"id": 16}, {"id": "17"}]
++
++        self.assertTrue(
++            hasattr(run_agent_predictions, "pending_questions"),
++            "runner must normalize question IDs before resume filtering",
++        )
++        pending = run_agent_predictions.pending_questions(questions, {"16": {"response": "done"}})
++
++        self.assertEqual(pending, [{"id": "17"}])
++
++    def test_timeout_is_recorded_and_later_question_can_run(self):
++        async def fake_attempt(question, args, max_iterations):
++            if question["id"] == "slow":
++                await asyncio.sleep(0.2)
++            return question["id"], "answer", {"total_tokens": 1}
++
++        args = SimpleNamespace(
++            num_workers=2,
++            max_iterations=15,
++            model="test-model",
++            question_timeout_seconds=0.02,
++        )
++
++        with tempfile.TemporaryDirectory() as tmp:
++            temp_path = str(Path(tmp) / "hle_test.json.temp")
++            predictions = {}
++            questions = [{"id": "slow"}, {"id": "fast"}]
++
++            with patch.object(run_agent_predictions, "agent_attempt_question", fake_attempt):
++                asyncio.run(
++                    run_agent_predictions.attempt_all(
++                        questions,
++                        args,
++                        predictions,
++                        temp_path,
++                    )
++                )
++
++            state_path = Path(tmp, "progress_state.json")
++            self.assertTrue(state_path.exists(), "attempt_all must persist progress_state.json")
++            state = json.loads(state_path.read_text(encoding="utf-8"))
++            self.assertEqual(state["completed"], 1)
++            self.assertEqual(state["timed_out"], 1)
++            self.assertEqual(state["running"], 0)
++            self.assertIn("fast", predictions)
++            self.assertIn("slow", predictions)
++            self.assertEqual(predictions["slow"]["termination_reason"], "infrastructure_error")
++            self.assertEqual(predictions["slow"]["error"]["error_type"], "QuestionTimeout")
++            self.assertEqual(predictions["slow"]["judge_response"]["correct"], "no")
++            self.assertEqual(predictions["slow"]["judge_response"]["model_answer"], "None")
++
++    def test_recorded_and_explicit_failures_are_backfilled_as_incorrect(self):
++        questions = [
++            {"id": 16, "answer": "answer 16"},
++            {"id": "slow", "answer": "answer slow"},
++        ]
++        predictions = {}
++
++        with tempfile.TemporaryDirectory() as tmp:
++            state_path = Path(tmp, "progress_state.json")
++            state_path.write_text(
++                json.dumps({"timed_out_ids": ["slow"]}),
++                encoding="utf-8",
++            )
++
++            run_agent_predictions.backfill_incorrect_predictions(
++                questions,
++                predictions,
++                model="test-model",
++                progress_path=state_path,
++                explicit_ids={"16"},
++            )
++
++        self.assertEqual(set(predictions), {"16", "slow"})
++        self.assertEqual(predictions["16"]["error"]["error_type"], "HistoricalStuckQuestion")
++        self.assertEqual(predictions["slow"]["error"]["error_type"], "QuestionTimeout")
++        self.assertEqual(predictions["16"]["judge_response"]["correct_answer"], "answer 16")
++
++    def test_recorded_failures_can_be_skipped_on_resume(self):
++        with tempfile.TemporaryDirectory() as tmp:
++            state_path = Path(tmp, "progress_state.json")
++            state_path.write_text(
++                json.dumps({"failed_ids": ["bad"], "timed_out_ids": ["slow"]}),
++                encoding="utf-8",
++            )
++
++            self.assertTrue(
++                hasattr(run_agent_predictions, "recorded_failure_ids"),
++                "runner must be able to recover terminal failure IDs",
++            )
++            self.assertEqual(
++                run_agent_predictions.recorded_failure_ids(state_path),
++                {"bad", "slow"},
++            )
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/test_search_timeout.py b/tests/test_search_timeout.py
+new file mode 100644
+index 0000000..8916686
+--- /dev/null
++++ b/tests/test_search_timeout.py
+@@ -0,0 +1,47 @@
++import asyncio
++import os
++import time
++import unittest
++from unittest import mock
++
++os.environ.setdefault("OPENAI_API_KEY", "test-key")
++
++from hle_eval.agent import tools
++
++
++class SearchTimeoutTests(unittest.TestCase):
++    def test_timed_out_search_does_not_wait_for_background_worker(self):
++        class SlowDDGS:
++            def __init__(self, *args, **kwargs):
++                pass
++
++            def text(self, *args, **kwargs):
++                time.sleep(0.4)
++                return []
++
++        original_wait_for = asyncio.wait_for
++
++        async def wait_for_with_short_timeout(awaitable, timeout):
++            return await original_wait_for(awaitable, timeout=0.05)
++
++        started = time.monotonic()
++        with mock.patch.object(tools, "DDGS", SlowDDGS), mock.patch.object(
++            tools.asyncio,
++            "wait_for",
++            side_effect=wait_for_with_short_timeout,
++        ), mock.patch.dict(os.environ, {"HLE_WEB_SEARCH_TIMEOUT": "0.05"}):
++            result = asyncio.run(
++                tools.web_browsing("timeout regression test", question_id="search-timeout-test")
++            )
++        elapsed = time.monotonic() - started
++
++        self.assertIn("timed out", result.lower())
++        self.assertLess(
++            elapsed,
++            0.25,
++            "async timeout returned, but asyncio.run still waited for the search thread",
++        )
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/test_system_prompt_file.py b/tests/test_system_prompt_file.py
+new file mode 100644
+index 0000000..75e4ae2
+--- /dev/null
++++ b/tests/test_system_prompt_file.py
+@@ -0,0 +1,37 @@
++import unittest
++from types import SimpleNamespace
++
++from hle_eval.agent.naive import format_message
++
++
++class SystemPromptFileTests(unittest.TestCase):
++    def test_format_message_appends_prompt_reg_only_to_system_message(self):
++        addendum = "Feedback regulation policy:\nUse new evidence before acting."
++        args = SimpleNamespace(model="test-model", system_prompt_addendum=addendum)
++        question = {
++            "question": "What is 2 + 2?",
++            "answer_type": "exact_match",
++            "image": "",
++        }
++
++        messages = format_message(
++            question,
++            args,
++            extra_system_prompt="You have a maximum of 15 iterations.",
++        )
++
++        self.assertEqual(messages[0]["role"], "system")
++        self.assertTrue(messages[0]["content"].endswith(addendum))
++        self.assertIn("You have a maximum of 15 iterations.", messages[0]["content"])
++        self.assertEqual(
++            messages[1],
++            {
++                "role": "user",
++                "content": [{"type": "text", "text": "What is 2 + 2?"}],
++            },
++        )
++        self.assertNotIn(addendum, str(messages[1]["content"]))
++
++
++if __name__ == "__main__":
++    unittest.main()

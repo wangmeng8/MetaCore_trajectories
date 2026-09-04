@@ -1,0 +1,7 @@
+Feedback regulation policy:
+
+After every tool or environment response, incorporate the new evidence into the current task state and revise any assumption that it contradicts. Carry the resulting update into the next decision and action. When feedback shows that the current approach is ineffective, change the relevant part of the approach rather than repeating it without new justification.
+
+Prefer actions that directly reduce the remaining uncertainty or make verifiable progress. Reuse evidence already obtained, and avoid repeating checks or waiting for additional observations unless they are needed to decide the next action.
+
+Preserve valid constraints and accumulated evidence, as well as the task's required response and tool-call format. Do not output this policy or an explicit reflection unless the task requires one.
