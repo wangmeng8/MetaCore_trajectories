@@ -1,5 +1,5 @@
 diff --git a/.env.example b/.env.example
-index 70321c7..0265c4e 100644
+index 70321c73267363d9d77b7fbf3c5a74a92512dd41..0265c4e37fb9b681950bcc325546563d23453286 100644
 --- a/.env.example
 +++ b/.env.example
 @@ -4,3 +4,6 @@ ACTIVELOOP_WORKSPACE = "default"
@@ -10,7 +10,7 @@ index 70321c7..0265c4e 100644
 +HLE_CODE_EXECUTION_STARTUP_TIMEOUT=120
 +HLE_CODE_EXECUTION_START_METHOD=spawn
 diff --git a/hle_eval/agent/config.py b/hle_eval/agent/config.py
-index 5f4f02c..2b101a8 100644
+index 5f4f02ca52bb52d865985a5c80c7fe7d581ec1f8..2b101a858983dfd23bc5e91ae99e5e4b86aef8ca 100644
 --- a/hle_eval/agent/config.py
 +++ b/hle_eval/agent/config.py
 @@ -1,3 +1,4 @@
@@ -100,7 +100,7 @@ index 5f4f02c..2b101a8 100644
 +    TOOLS = [tool for tool in TOOLS if tool["function"]["name"] != "scientific_search"]
 diff --git a/hle_eval/agent/ddgs_worker.py b/hle_eval/agent/ddgs_worker.py
 new file mode 100644
-index 0000000..875c244
+index 0000000000000000000000000000000000000000..875c244d72ba74bb0537e70232cabcaf63b9ef55
 --- /dev/null
 +++ b/hle_eval/agent/ddgs_worker.py
 @@ -0,0 +1,36 @@
@@ -141,7 +141,7 @@ index 0000000..875c244
 +if __name__ == "__main__":
 +    raise SystemExit(main())
 diff --git a/hle_eval/agent/naive.py b/hle_eval/agent/naive.py
-index 77fc2f4..0d87fb5 100644
+index 77fc2f48b9d121d4fa5422388517ec30015e6061..0d87fb587e3271f04cf3f4c7849502804673727e 100644
 --- a/hle_eval/agent/naive.py
 +++ b/hle_eval/agent/naive.py
 @@ -94,6 +94,10 @@ def format_message(question, args, extra_system_prompt: str = None):
@@ -163,7 +163,7 @@ index 77fc2f4..0d87fb5 100644
 \ No newline at end of file
 +    return question["id"], content, tokens
 diff --git a/hle_eval/agent/run_utils.py b/hle_eval/agent/run_utils.py
-index 3c1420f..54b4055 100644
+index 3c1420f3823a38296f59b1c5c9395592f7cd7615..54b405592a813ee79d9d794d36b07e8c835b5f94 100644
 --- a/hle_eval/agent/run_utils.py
 +++ b/hle_eval/agent/run_utils.py
 @@ -8,6 +8,14 @@ from typing import Optional
@@ -238,20 +238,20 @@ index 3c1420f..54b4055 100644
  
  
 diff --git a/hle_eval/agent/tools.py b/hle_eval/agent/tools.py
-index 85dfb4d..65b6e46 100644
+index 85dfb4debdf221d12c1aab5c250fc3447188983a..27692dd1b5d3dd6bbcea9548e7a178c012e3abd8 100644
 --- a/hle_eval/agent/tools.py
 +++ b/hle_eval/agent/tools.py
-@@ -8,12 +8,17 @@ import json
+@@ -8,12 +8,15 @@ import json
  import ast
  import io
  import asyncio
+-import requests
 +import multiprocessing
 +import sys
- import requests
  import aiohttp
 +import signal
  from datetime import datetime
- from bs4 import BeautifulSoup
+-from bs4 import BeautifulSoup
  from urllib.parse import urlparse
  from ddgs import DDGS
 +from ddgs.engines import ENGINES
@@ -259,7 +259,7 @@ index 85dfb4d..65b6e46 100644
  from contextlib import redirect_stdout, redirect_stderr
  from typing import Tuple
  from hle_eval.agent.config import EXTRA_BODY, client, AL_WORKSPACE, ACTIVELOOP_BASE_URL, ACTIVELOOP_HEADERS, TOOLS
-@@ -34,6 +39,277 @@ from hle_eval.agent.utils import (
+@@ -34,6 +37,319 @@ from hle_eval.agent.utils import (
  )
  
  
@@ -332,6 +332,48 @@ index 85dfb4d..65b6e46 100644
 +    if not isinstance(results, list):
 +        raise RuntimeError("DDGS worker returned a non-list result")
 +    return results
++
++
++async def _run_web_fetch(url: str, headers: dict, timeout: float) -> str:
++    process_kwargs = {"start_new_session": True} if os.name != "nt" else {}
++    process = await asyncio.create_subprocess_exec(
++        sys.executable,
++        "-m",
++        "hle_eval.agent.web_fetch_worker",
++        stdin=asyncio.subprocess.PIPE,
++        stdout=asyncio.subprocess.PIPE,
++        stderr=asyncio.subprocess.PIPE,
++        **process_kwargs,
++    )
++    request = json.dumps(
++        {
++            "url": url,
++            "headers": headers,
++            "timeout": min(8.0, timeout),
++        }
++    ).encode("utf-8")
++    try:
++        stdout, stderr = await asyncio.wait_for(
++            process.communicate(request),
++            timeout=timeout,
++        )
++    except asyncio.TimeoutError:
++        await _terminate_async_process(process)
++        raise
++    except asyncio.CancelledError:
++        await _terminate_async_process(process)
++        raise
++
++    if process.returncode != 0:
++        details = stderr.decode("utf-8", errors="replace").strip()
++        raise RuntimeError(details or f"Web fetch worker exited with code {process.returncode}")
++    try:
++        payload = json.loads(stdout.decode("utf-8"))
++    except json.JSONDecodeError as exc:
++        raise RuntimeError("Web fetch worker returned invalid JSON") from exc
++    if not payload.get("ok"):
++        raise RuntimeError(payload.get("error") or "Web fetch failed")
++    return str(payload.get("content") or "")
 +
 +
 +def get_duplicate_tool_threshold() -> int:
@@ -537,7 +579,7 @@ index 85dfb4d..65b6e46 100644
  # Persistent execution environments per question_id
  # This dictionary stores the globals environment for each question_id
  # so that variables, functions, and imports persist across code_interpreter calls
-@@ -44,6 +320,8 @@ _environments_lock = asyncio.Lock()
+@@ -44,6 +360,8 @@ _environments_lock = asyncio.Lock()
  # This prevents concurrent executions from interfering with each other
  _question_locks = {}
  _question_locks_lock = asyncio.Lock()
@@ -546,7 +588,7 @@ index 85dfb4d..65b6e46 100644
  
  
  async def _get_execution_environment(question_id: str = None):
-@@ -89,6 +367,14 @@ async def _get_execution_environment(question_id: str = None):
+@@ -89,6 +407,14 @@ async def _get_execution_environment(question_id: str = None):
                      'range': range,
                      'enumerate': enumerate,
                      'zip': zip,
@@ -561,7 +603,7 @@ index 85dfb4d..65b6e46 100644
                      'sum': sum,
                      'max': max,
                      'min': min,
-@@ -169,9 +455,22 @@ async def _get_question_lock(question_id: str = None):
+@@ -169,9 +495,22 @@ async def _get_question_lock(question_id: str = None):
          return _question_locks[env_key]
  
  
@@ -584,7 +626,7 @@ index 85dfb4d..65b6e46 100644
      async with _environments_lock:
          if env_key in _execution_environments:
              del _execution_environments[env_key]
-@@ -180,6 +479,30 @@ async def _cleanup_execution_environment(question_id: str = None):
+@@ -180,6 +519,30 @@ async def _cleanup_execution_environment(question_id: str = None):
              del _question_locks[env_key]
  
  
@@ -615,7 +657,7 @@ index 85dfb4d..65b6e46 100644
  # Tool implementations
  async def web_browsing(query: str, max_results: int = 5, question_id: str = None, is_last_tool: bool = False) -> str:
      """Search the web using DuckDuckGo to find information about a query."""
-@@ -208,15 +531,13 @@ async def web_browsing(query: str, max_results: int = 5, question_id: str = None
+@@ -208,15 +571,12 @@ async def web_browsing(query: str, max_results: int = 5, question_id: str = None
          
          trace_warning(f"web_browsing: Executing DDGS search with query='{search_query}', max_results={max_results}", question_id)
          
@@ -624,7 +666,6 @@ index 85dfb4d..65b6e46 100644
 -            # Request a few more results to account for filtering
 -            return list(DDGS().text(search_query, max_results=max_results + 3))
 -        
-+        loop = asyncio.get_running_loop()
 +        search_timeout = _positive_timeout_from_env("HLE_WEB_SEARCH_TIMEOUT", 30.0)
          try:
 -            raw_results = await asyncio.wait_for(
@@ -637,16 +678,35 @@ index 85dfb4d..65b6e46 100644
              )
          except asyncio.TimeoutError:
              error_msg = f"Search request timed out for query: '{query}'"
-@@ -261,7 +582,7 @@ async def web_browsing(query: str, max_results: int = 5, question_id: str = None
+@@ -260,25 +620,8 @@ async def web_browsing(query: str, max_results: int = 5, question_id: str = None
+             title = r.get('title', 'N/A')
              content = r.get('body', 'N/A')
              try:
-                 def fetch():
+-                def fetch():
 -                    response = requests.get(r['href'], headers=headers, timeout=10)
-+                    response = requests.get(r['href'], headers=headers, timeout=8)
-                     soup = BeautifulSoup(response.text, 'html.parser')
-                     # Remove unwanted tags that don't contain useful content
-                     for tag in soup(["script", "style", "nav", "footer"]):
-@@ -326,7 +647,7 @@ async def get_file_metadata(file_id: str, base_url: str = ACTIVELOOP_BASE_URL, h
+-                    soup = BeautifulSoup(response.text, 'html.parser')
+-                    # Remove unwanted tags that don't contain useful content
+-                    for tag in soup(["script", "style", "nav", "footer"]):
+-                        tag.decompose()
+-                    # Get text with separator to preserve structure (tables, lists, code blocks)
+-                    text = soup.get_text(separator="\n", strip=True)
+-                    # Truncate while preserving structure
+-                    if len(text) > 1000:
+-                        # Try to truncate at a newline to avoid cutting mid-sentence
+-                        truncated = text[:1000]
+-                        last_newline = truncated.rfind('\n')
+-                        if last_newline > 800:  # Only use newline truncation if it's reasonable
+-                            text = truncated[:last_newline] + "\n..."
+-                        else:
+-                            text = truncated + "..."
+-                    return text
+-                content = await loop.run_in_executor(None, fetch)
++                fetch_timeout = _positive_timeout_from_env("HLE_WEB_FETCH_TIMEOUT", 10.0)
++                content = await _run_web_fetch(r['href'], headers, fetch_timeout)
+             except Exception:
+                 pass
+             return title, content
+@@ -326,7 +669,7 @@ async def get_file_metadata(file_id: str, base_url: str = ACTIVELOOP_BASE_URL, h
      async with aiohttp.ClientSession() as session:
          headers = dict(headers)
          # headers["accept"] = "application/json"
@@ -655,7 +715,7 @@ index 85dfb4d..65b6e46 100644
              if response.status == 200:
                  return await response.json()
              else:
-@@ -338,7 +659,7 @@ async def get_file(file_id: str, base_url: str = ACTIVELOOP_BASE_URL, headers: d
+@@ -338,7 +681,7 @@ async def get_file(file_id: str, base_url: str = ACTIVELOOP_BASE_URL, headers: d
      async with aiohttp.ClientSession() as session:
          headers = dict(headers)
          # headers["accept"] = "application/json"
@@ -664,7 +724,7 @@ index 85dfb4d..65b6e46 100644
              if response.status == 200:
                  return await response.content.read()
              else:
-@@ -346,7 +667,7 @@ async def get_file(file_id: str, base_url: str = ACTIVELOOP_BASE_URL, headers: d
+@@ -346,7 +689,7 @@ async def get_file(file_id: str, base_url: str = ACTIVELOOP_BASE_URL, headers: d
  
  
  async def scientific_search(query: str, top_k: int = 10, question_id: str = None, is_last_tool: bool = False) -> str:
@@ -673,7 +733,7 @@ index 85dfb4d..65b6e46 100644
      # Ensure top_k is an integer
      try:
          top_k = int(top_k)
-@@ -359,98 +680,62 @@ async def scientific_search(query: str, top_k: int = 10, question_id: str = None
+@@ -359,98 +702,62 @@ async def scientific_search(query: str, top_k: int = 10, question_id: str = None
      start_time = trace_tool_call("scientific_search", {"query": query, "top_k": top_k}, question_id, indent_level=2)
      
      try:
@@ -822,7 +882,7 @@ index 85dfb4d..65b6e46 100644
      except asyncio.TimeoutError:
          error_msg = f"Search request timed out for query: '{query}'"
          trace_tool_result("scientific_search", error_msg, success=False, question_id=question_id, indent_level=2, is_last_tool=is_last_tool, start_time=start_time)
-@@ -606,50 +891,32 @@ async def code_interpreter(code: str, question_id: str = None, is_last_tool: boo
+@@ -606,50 +913,32 @@ async def code_interpreter(code: str, question_id: str = None, is_last_tool: boo
          with open(code_file_path, "a", encoding="utf-8") as f:
              f.write(code + "\n\n")
      
@@ -891,7 +951,7 @@ index 85dfb4d..65b6e46 100644
              
              if stderr_output:
                  result = f"Error: {stderr_output}\nOutput: {stdout_output}"
-@@ -699,7 +966,7 @@ def get_model_name(args, question_id: str):
+@@ -699,7 +988,7 @@ def get_model_name(args, question_id: str):
      return args.model
  
  
@@ -900,7 +960,7 @@ index 85dfb4d..65b6e46 100644
      """Configure tools and tool_choice based on current iteration.
      
      Strategy:
-@@ -710,27 +977,35 @@ def configure_tools_for_iteration(iteration: int, max_iterations: int, messages:
+@@ -710,27 +999,35 @@ def configure_tools_for_iteration(iteration: int, max_iterations: int, messages:
      while preventing it from gathering new information in the final step.
      Note: The final forced answer call (after loop) disables all tools via make_final_answer_call.
      """
@@ -943,7 +1003,7 @@ index 85dfb4d..65b6e46 100644
      
      return tools_available, tool_choice
  
-@@ -1011,17 +1286,24 @@ def check_and_break_tool_loop(consecutive_tool_only_iterations: int, iteration:
+@@ -1011,17 +1308,24 @@ def check_and_break_tool_loop(consecutive_tool_only_iterations: int, iteration:
  async def handle_tool_calls(message, messages: list, question_id: str, iteration: int, max_iterations: int,
                             recent_tool_calls: list, message_content: str, api_start_time: int,
                             iteration_start_time: int, reasoning: str, total_tokens: dict, tool_outputs_hash: set = None,
@@ -971,7 +1031,7 @@ index 85dfb4d..65b6e46 100644
      # Keep only last 3 iterations
      if len(recent_tool_calls) > 3:
          recent_tool_calls.pop(0)
-@@ -1046,15 +1328,38 @@ async def handle_tool_calls(message, messages: list, question_id: str, iteration
+@@ -1046,15 +1350,38 @@ async def handle_tool_calls(message, messages: list, question_id: str, iteration
      for idx, tool_call in enumerate(message.tool_calls):
          # Create a hash of function name AND arguments to detect exact duplicates
          # e.g., web_browsing("Piet programming language") called twice
@@ -1013,7 +1073,7 @@ index 85dfb4d..65b6e46 100644
              continue  # Skip execution of duplicate
          
          tool_calls_history.add(call_signature)
-@@ -1083,11 +1388,14 @@ async def handle_tool_calls(message, messages: list, question_id: str, iteration
+@@ -1083,11 +1410,14 @@ async def handle_tool_calls(message, messages: list, question_id: str, iteration
      # Detect repetitive tool call patterns
      if len(recent_tool_calls) >= 2:
          if recent_tool_calls[-1] == recent_tool_calls[-2]:
@@ -1030,7 +1090,7 @@ index 85dfb4d..65b6e46 100644
                  })
      
      # print(f"  {_colorize('└─', Colors.BRIGHT_BLUE)}\n")
-@@ -1137,8 +1445,8 @@ async def make_final_answer_call(messages, args, max_iterations: int, question_i
+@@ -1137,8 +1467,8 @@ async def make_final_answer_call(messages, args, max_iterations: int, question_i
              temperature=args.temperature,
              max_completion_tokens=args.max_completion_tokens,
              messages=messages,
@@ -1041,7 +1101,7 @@ index 85dfb4d..65b6e46 100644
              stream=False,
              extra_body=EXTRA_BODY
          )
-@@ -1255,6 +1563,13 @@ async def attempt_question(question, args, max_iterations: int = 15):
+@@ -1255,6 +1585,13 @@ async def attempt_question(question, args, max_iterations: int = 15):
      consecutive_tool_only_iterations = 0
      tool_outputs_hash = set()  # Track tool output content to detect repeated outputs
      tool_calls_history = set()  # Track tool call signatures (function name + arguments) to detect exact duplicates
@@ -1055,7 +1115,7 @@ index 85dfb4d..65b6e46 100644
      
      try:
          while iteration < max_iterations:
-@@ -1266,19 +1581,23 @@ async def attempt_question(question, args, max_iterations: int = 15):
+@@ -1266,19 +1603,23 @@ async def attempt_question(question, args, max_iterations: int = 15):
              # Get model name and configure tools
              model_name = get_model_name(args, question_id)
              api_start_time = trace_api_call(model_name, iteration, question_id, messages=messages)
@@ -1090,7 +1150,7 @@ index 85dfb4d..65b6e46 100644
              
              message = response.choices[0].message
              message_content, reasoning, reasoning_field_name = extract_content_and_reasoning(message)
-@@ -1310,11 +1629,15 @@ async def attempt_question(question, args, max_iterations: int = 15):
+@@ -1310,11 +1651,15 @@ async def attempt_question(question, args, max_iterations: int = 15):
                      consecutive_tool_only_iterations = 0
                  
                  # Check and break tool loop if needed
@@ -1107,7 +1167,7 @@ index 85dfb4d..65b6e46 100644
                      continue
                  
                  # Handle tool calls
-@@ -1322,7 +1645,8 @@ async def attempt_question(question, args, max_iterations: int = 15):
+@@ -1322,7 +1667,8 @@ async def attempt_question(question, args, max_iterations: int = 15):
                      message, messages, question_id, iteration, max_iterations,
                      recent_tool_calls, message_content, api_start_time,
                      iteration_start_time, reasoning, total_tokens, tool_outputs_hash,
@@ -1117,15 +1177,62 @@ index 85dfb4d..65b6e46 100644
                  )
                  continue
              
-@@ -1544,4 +1868,4 @@ print("Objective value =", pulp.value(problem.objective))
+@@ -1544,4 +1890,4 @@ print("Objective value =", pulp.value(problem.objective))
          f.write(result)
      exit()
  
 -    print(result)
 \ No newline at end of file
 +    print(result)
+diff --git a/hle_eval/agent/web_fetch_worker.py b/hle_eval/agent/web_fetch_worker.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..eae07346bfe290200a5e5fffba356ff5c7a0fed6
+--- /dev/null
++++ b/hle_eval/agent/web_fetch_worker.py
+@@ -0,0 +1,41 @@
++"""Isolated webpage fetch worker that can be force-killed on timeout."""
++
++import json
++import sys
++
++import requests
++from bs4 import BeautifulSoup
++
++
++def main() -> int:
++    try:
++        request = json.load(sys.stdin)
++        response = requests.get(
++            str(request["url"]),
++            headers=request.get("headers") or {},
++            timeout=float(request.get("timeout", 8.0)),
++        )
++        soup = BeautifulSoup(response.text, "html.parser")
++        for tag in soup(["script", "style", "nav", "footer"]):
++            tag.decompose()
++        content = soup.get_text(separator="\n", strip=True)
++        if len(content) > 1000:
++            truncated = content[:1000]
++            last_newline = truncated.rfind("\n")
++            if last_newline > 800:
++                content = truncated[:last_newline] + "\n..."
++            else:
++                content = truncated + "..."
++        json.dump({"ok": True, "content": content}, sys.stdout, ensure_ascii=False)
++        return 0
++    except Exception as exc:
++        json.dump(
++            {"ok": False, "error": f"{type(exc).__name__}: {exc}"},
++            sys.stdout,
++            ensure_ascii=False,
++        )
++        return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
 diff --git a/hle_eval/run_agent_predictions.py b/hle_eval/run_agent_predictions.py
-index ec2dc95..3ec5267 100644
+index ec2dc9592cc50abab102a0093d0974f6a766c997..3ec5267b9ac52e4db890bde7f57894b5a8e11832 100644
 --- a/hle_eval/run_agent_predictions.py
 +++ b/hle_eval/run_agent_predictions.py
 @@ -15,6 +15,10 @@ import os
@@ -1631,7 +1738,7 @@ index ec2dc95..3ec5267 100644
 +        parser.error("--num_rollouts must be at least 1")
      main(args)
 diff --git a/pyproject.toml b/pyproject.toml
-index 4464ca3..e08b7c7 100644
+index 4464ca37b31fe7773a19404373d48b5fb182aceb..e08b7c7fd69784e24148158b12760cb1d8c32e55 100644
 --- a/pyproject.toml
 +++ b/pyproject.toml
 @@ -17,7 +17,7 @@ dependencies = [
@@ -1645,7 +1752,7 @@ index 4464ca3..e08b7c7 100644
      "networkx>=3.5",
 diff --git a/tests/test_code_interpreter_timeout.py b/tests/test_code_interpreter_timeout.py
 new file mode 100644
-index 0000000..a4d9323
+index 0000000000000000000000000000000000000000..a4d9323a0b3ca4da613c2e83f18a2fe10d8127a2
 --- /dev/null
 +++ b/tests/test_code_interpreter_timeout.py
 @@ -0,0 +1,93 @@
@@ -1744,7 +1851,7 @@ index 0000000..a4d9323
 +    unittest.main()
 diff --git a/tests/test_question_timeout_progress.py b/tests/test_question_timeout_progress.py
 new file mode 100644
-index 0000000..8f45578
+index 0000000000000000000000000000000000000000..8f45578c92d3aac25a259b063f3e8412d428985e
 --- /dev/null
 +++ b/tests/test_question_timeout_progress.py
 @@ -0,0 +1,114 @@
@@ -1864,12 +1971,14 @@ index 0000000..8f45578
 +    unittest.main()
 diff --git a/tests/test_search_timeout.py b/tests/test_search_timeout.py
 new file mode 100644
-index 0000000..8916686
+index 0000000000000000000000000000000000000000..1fc64255a586586b439a9a44be605524fbaedc2d
 --- /dev/null
 +++ b/tests/test_search_timeout.py
-@@ -0,0 +1,47 @@
+@@ -0,0 +1,146 @@
 +import asyncio
 +import os
++import socket
++import threading
 +import time
 +import unittest
 +from unittest import mock
@@ -1912,12 +2021,109 @@ index 0000000..8916686
 +            "async timeout returned, but asyncio.run still waited for the search thread",
 +        )
 +
++    def test_timed_out_page_fetch_does_not_hold_the_default_executor_open(self):
++        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
++        server.bind(("127.0.0.1", 0))
++        server.listen(1)
++        port = server.getsockname()[1]
++
++        def serve_slow_response():
++            connection, _ = server.accept()
++            try:
++                connection.recv(4096)
++                time.sleep(0.4)
++            finally:
++                connection.close()
++                server.close()
++
++        thread = threading.Thread(target=serve_slow_response, daemon=True)
++        thread.start()
++
++        async def fake_search(*args, **kwargs):
++            return [
++                {
++                    "title": "Slow page",
++                    "href": f"http://127.0.0.1:{port}/slow",
++                    "body": "Fallback snippet",
++                }
++            ]
++
++        started = time.monotonic()
++        with mock.patch.object(tools, "_run_ddgs_search", side_effect=fake_search), mock.patch.dict(
++            os.environ,
++            {"HLE_WEB_FETCH_TIMEOUT": "0.05"},
++        ):
++            result = asyncio.run(
++                tools.web_browsing("page fetch timeout test", question_id="fetch-timeout-test")
++            )
++        elapsed = time.monotonic() - started
++
++        self.assertIn("Fallback snippet", result)
++        self.assertLess(
++            elapsed,
++            0.25,
++            "page fetch timeout returned, but asyncio.run waited for a requests thread",
++        )
++
++    def test_question_cancellation_kills_active_page_fetch(self):
++        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
++        server.bind(("127.0.0.1", 0))
++        server.listen(1)
++        port = server.getsockname()[1]
++
++        def serve_slow_response():
++            connection, _ = server.accept()
++            try:
++                connection.recv(4096)
++                time.sleep(0.4)
++            finally:
++                connection.close()
++                server.close()
++
++        threading.Thread(target=serve_slow_response, daemon=True).start()
++
++        async def fake_search(*args, **kwargs):
++            return [
++                {
++                    "title": "Slow page",
++                    "href": f"http://127.0.0.1:{port}/slow",
++                    "body": "Fallback snippet",
++                }
++            ]
++
++        async def run_with_question_timeout():
++            try:
++                await asyncio.wait_for(
++                    tools.web_browsing(
++                        "question cancellation test",
++                        question_id="question-cancellation-test",
++                    ),
++                    timeout=0.05,
++                )
++            except asyncio.TimeoutError:
++                return
++            self.fail("outer question timeout did not fire")
++
++        started = time.monotonic()
++        with mock.patch.object(tools, "_run_ddgs_search", side_effect=fake_search), mock.patch.dict(
++            os.environ,
++            {"HLE_WEB_FETCH_TIMEOUT": "5"},
++        ):
++            asyncio.run(run_with_question_timeout())
++        elapsed = time.monotonic() - started
++
++        self.assertLess(
++            elapsed,
++            0.25,
++            "question cancellation did not terminate the active page-fetch process",
++        )
++
 +
 +if __name__ == "__main__":
 +    unittest.main()
 diff --git a/tests/test_system_prompt_file.py b/tests/test_system_prompt_file.py
 new file mode 100644
-index 0000000..75e4ae2
+index 0000000000000000000000000000000000000000..75e4ae2fc058d22b51bf3bfcdf29a12b124a7c60
 --- /dev/null
 +++ b/tests/test_system_prompt_file.py
 @@ -0,0 +1,37 @@

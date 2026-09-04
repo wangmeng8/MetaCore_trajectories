@@ -7,6 +7,7 @@ versioned local patch before installing it:
 ```bash
 python -m pip install uv
 git clone https://github.com/activeloopai/hle_with_tools .external/hle_with_tools
+git -C .external/hle_with_tools checkout 7a348ce
 git -C .external/hle_with_tools apply ../../patches/hle_with_tools/local_hle_with_tools_fixes.patch
 cd .external/hle_with_tools
 uv venv --python 3.12
@@ -16,8 +17,8 @@ cd ../..
 
 The patch contains the Prompt-Reg system-message support, resumable
 per-question state, whole-question timeouts, code-execution process isolation,
-and subprocess-isolated DDGS search timeouts. It is based on official commit
-`7a348ce` (`bigmain`).
+subprocess-isolated DDGS search timeouts, and subprocess-isolated webpage
+content fetches. It is based on official commit `7a348ce` (`bigmain`).
 
 Configure an OpenAI-compatible model endpoint. Do not store real keys in Git:
 
@@ -30,6 +31,7 @@ export HLE_CODE_EXECUTION_STARTUP_TIMEOUT=120
 export HLE_CODE_EXECUTION_START_METHOD=spawn
 export HLE_DUPLICATE_TOOL_THRESHOLD=2
 export HLE_WEB_SEARCH_TIMEOUT=30
+export HLE_WEB_FETCH_TIMEOUT=10
 export HLE_SCIENTIFIC_SEARCH_TIMEOUT=20
 ```
 
