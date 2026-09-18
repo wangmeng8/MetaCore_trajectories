@@ -15,7 +15,7 @@ The MVP goal is local reproducibility, not leaderboard submission.
 - Builds normalized per-task trajectory JSON files.
 - Exports a benchmark-oriented JSON/JSONL format with `benchmark`, `task.instruction`, and serialized `trajectory_text`.
 - Writes `trajectories.jsonl`, `summary.json`, and `manifest.json`.
-- Also includes MVP runners for Terminal-Bench 2.0, OSWorld-Verified, and official HLE-with-tools collection.
+- Also includes MVP runners for Terminal-Bench 2.1, OSWorld-Verified, and official HLE-with-tools collection.
 - Includes an integration wrapper for the external MetaCoreBench representation visualization toolkit.
 
 ## Install
@@ -57,6 +57,309 @@ python scripts/create_migration_package.py
 
 The archive includes project code, `data/`, `.external/`, and dependency snapshots. It recursively excludes `.env`, virtual environments, run outputs, Git metadata, and cache directories, including nested environments such as `.external/*/.venv/`.
 
+## Reproducible Setup From a Fresh Clone
+
+The root repository contains the MetaCoreBench runners, collectors, tests, and
+some small sample files. It intentionally does **not** contain virtual
+environments, API keys, run outputs, the full HLE dataset, or the benchmark
+checkouts under `.external/`. Prepare the benchmark-specific dependencies below
+before starting a real run.
+
+### Common setup
+
+On a Linux server:
+
+```bash
+git clone https://github.com/wangmeng8/MetaCore_trajectories.git
+cd MetaCore_trajectories
+
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip setuptools wheel
+python -m pip install -e .
+cp .env.example .env
+```
+
+The root `pyproject.toml` is intentionally lightweight. Install the
+dependencies for the benchmark you are actually running rather than assuming
+that `pip install -e .` installs Tau2, HLE-with-tools, Harbor, or OSWorld.
+Use `python scripts/<runner> --dry-run` to check the wrapper without making
+model calls.
+
+### Tau2-bench
+
+Clone and install the official Tau2 checkout. Tau2 currently requires Python
+3.12 or newer and uses `uv` for installation:
+
+```bash
+python -m pip install uv
+git clone https://github.com/sierra-research/tau2-bench .external/tau2-bench
+cd .external/tau2-bench
+uv sync
+cd ../..
+```
+
+Set the model API in `.env` or in the shell. `OPENAI_BASE_URL` may point to any
+OpenAI-compatible endpoint; the runner maps it to `OPENAI_API_BASE` when Tau2
+needs the older LiteLLM variable:
+
+```bash
+export OPENAI_API_KEY='your-model-api-key'
+export OPENAI_BASE_URL='https://your-provider.example/v1'
+```
+
+Run a one-task smoke test:
+
+```bash
+python scripts/run_tau2_gpt55.py \
+  --tau2-command "uv run tau2" \
+  --tau2-repo-dir .external/tau2-bench \
+  --domain airline \
+  --agent-model openai/gpt-5.5 \
+  --user-model openai/gpt-5.5 \
+  --num-tasks 1 \
+  --num-rollouts 1 \
+  --max-workers 2 \
+  --run-id tau2_airline_smoke \
+  --output-dir outputs/runs
+```
+
+Run all tasks in all three supported text domains sequentially:
+
+```bash
+python scripts/run_tau2_gpt55.py \
+  --tau2-command "uv run tau2" \
+  --tau2-repo-dir .external/tau2-bench \
+  --domains airline retail telecom \
+  --agent-model openai/gpt-5.5 \
+  --user-model openai/gpt-5.5 \
+  --num-rollouts 1 \
+  --all-tasks \
+  --max-workers 8 \
+  --run-id tau2_full \
+  --progress-interval 30 \
+  --output-dir outputs/runs
+```
+
+Important Tau2 options:
+
+- `--domains airline retail telecom` runs the domains one after another. Use
+  `--domain airline` for one domain.
+- `--num-rollouts N` is an alias for Tau2's `--num-trials N` and runs `N`
+  independent trials per task.
+- `--max-workers N` controls concurrency when the installed Tau2 CLI exposes a
+  compatible worker flag. Start with `2` or `4` for rate-limited endpoints.
+- `--one-by-one --max-workers 8` runs one task process at a time while keeping
+  up to eight task processes in flight, with checkpoints after each task.
+- Use a fixed `--run-id` with `--resume` to rebuild the normalized files from
+  existing raw files. In `--one-by-one` mode, completed task folders are also
+  skipped.
+
+For a safer long run:
+
+```bash
+python scripts/run_tau2_gpt55.py \
+  --tau2-command "uv run tau2" \
+  --tau2-repo-dir .external/tau2-bench \
+  --domain airline \
+  --agent-model openai/gpt-5.5 \
+  --user-model openai/gpt-5.5 \
+  --num-rollouts 1 \
+  --all-tasks \
+  --one-by-one \
+  --resume \
+  --run-id tau2_airline_full \
+  --max-workers 8 \
+  --output-dir outputs/runs
+```
+
+Tau2 writes raw simulations under the checkout's `data/simulations/` by
+default. The wrapper copies changed raw files and writes normalized results to
+`outputs/runs/<run-id>/`, including `summary.json`, `manifest.json`,
+`trajectories.jsonl`, and `benchmark_trajectories.jsonl`.
+
+### HLE with tools
+
+Use the official `activeloopai/hle_with_tools` checkout. The official project
+requires Python 3.12 or newer. Create its isolated environment and install the
+official package:
+
+```bash
+python -m pip install uv
+git clone https://github.com/activeloopai/hle_with_tools .external/hle_with_tools
+git -C .external/hle_with_tools apply ../../patches/hle_with_tools/local_hle_with_tools_fixes.patch
+cd .external/hle_with_tools
+uv venv --python 3.12
+uv pip install --python .venv/bin/python -e .
+cd ../..
+```
+
+HLE can load `cais/hle` from Hugging Face directly:
+
+```bash
+export HF_HOME="$PWD/.hf-cache"
+export HF_DATASETS_CACHE="$PWD/.hf-cache/datasets"
+```
+
+Alternatively, provide a local parquet/json/jsonl file with `--data-path`.
+The full HLE data files are ignored by this repository and must be downloaded
+or copied separately.
+
+Configure the model endpoint and the official scientific-search service:
+
+```bash
+export OPENAI_API_KEY='your-model-api-key'
+export OPENAI_BASE_URL='https://your-provider.example/v1'
+
+export ACTIVELOOP_API_KEY='your-activeloop-api-key'
+export ACTIVELOOP_WORKSPACE='default'
+export ACTIVELOOP_BASE_URL='https://science-api.activeloop.ai'
+```
+
+Run a one-example smoke test using the isolated official environment:
+
+```bash
+.external/hle_with_tools/.venv/bin/python scripts/run_hle_with_tools.py \
+  --repo-dir .external/hle_with_tools \
+  --dataset cais/hle \
+  --model gpt-5.5 \
+  --num-tasks 1 \
+  --max-workers 2 \
+  --max-retries 3 \
+  --process-retries 1 \
+  --max-completion-tokens 40000 \
+  --max-iterations 15 \
+  --run-id hle_smoke \
+  --output-dir outputs/runs \
+  --no-uv
+```
+
+Run all text-only examples with four workers:
+
+```bash
+.external/hle_with_tools/.venv/bin/python scripts/run_hle_with_tools.py \
+  --repo-dir .external/hle_with_tools \
+  --dataset cais/hle \
+  --model gpt-5.5 \
+  --all-tasks \
+  --max-workers 4 \
+  --max-retries 3 \
+  --process-retries 1 \
+  --max-completion-tokens 40000 \
+  --max-iterations 15 \
+  --run-id hle_gpt55_full \
+  --progress-interval 30 \
+  --output-dir outputs/runs \
+  --no-uv
+```
+
+Run the 500-example Prompt-Reg condition with the same HLE harness and model
+settings as Vanilla:
+
+```bash
+export OPENAI_API_KEY='your-model-api-key'
+export OPENAI_BASE_URL='http://127.0.0.1:8000/v1'
+bash scripts/run_hle_prompt_reg.sh
+```
+
+The launcher reads `prompts/hle/prompt_reg.txt` and appends its complete text
+to the existing HLE system message before the user question. Override launcher
+defaults through `HLE_MODEL`, `HLE_MAX_WORKERS`, `HLE_RUN_ID`, `OUTPUT_DIR`, and
+the other `HLE_*` variables. For an ad hoc prompt, call
+`scripts/run_hle_with_tools.py --system-prompt-file <path>` directly. Each run
+also snapshots the supplied text as `system_prompt.txt` in its output directory.
+
+Important HLE options and behavior:
+
+- `--num-rollouts N` runs `N` independent rollouts per selected example.
+- `--system-prompt-file PATH` appends a UTF-8 prompt to the system message;
+  omit it for the unchanged Vanilla condition.
+- `--max-workers` is the official async worker count. The official runner
+  requires at least two workers; use `2` first when the endpoint is unstable.
+- Reuse the same `--run-id` after an interruption. The official temp prediction
+  file is checked incrementally and completed predictions are resumed.
+- `--max-completion-tokens 40000` and `--max-iterations 15` match the official
+  README defaults. The wrapper omits `temperature` unless explicitly supplied.
+- The official tools are `code_interpreter`, `web_browsing`, and
+  `scientific_search`. Scientific search needs the ActiveLoop variables above;
+  web browsing also depends on outbound network access from the server.
+- The wrapper preserves official raw files and traces and additionally writes
+  normalized `trajectory_text` records under the run directory.
+
+The root repository does not track `.external/hle_with_tools`. The local
+compatibility, Prompt-Reg, per-question timeout, and hard tool-timeout changes
+are stored in
+`patches/hle_with_tools/local_hle_with_tools_fixes.patch`. Apply that patch to
+a clean official checkout with the command above before running experiments.
+
+### Terminal-Bench 2.1
+
+Terminal-Bench 2.1 uses the official Harbor dataset `terminal-bench/terminal-bench-2-1`.
+It is a revised benchmark snapshot with 89 tasks; use `--dataset terminal-bench/terminal-bench-2`
+explicitly when reproducing the earlier 2.0 run.
+
+Terminal-Bench is executed through Harbor and requires Docker or another
+supported Harbor sandbox provider. Install Harbor outside the root Python
+environment:
+
+```bash
+python -m pip install uv
+uv tool install harbor
+harbor --help
+docker info
+```
+
+Set the provider API key required by the selected Harbor agent. For the default
+OpenAI-compatible setup:
+
+```bash
+export OPENAI_API_KEY='your-model-api-key'
+export OPENAI_BASE_URL='https://your-provider.example/v1'
+```
+
+Run one task:
+
+```bash
+python scripts/run_terminal_bench.py \
+  --dataset terminal-bench/terminal-bench-2-1 \
+  --agent terminus-2 \
+  --model openai/gpt-5.5 \
+  --num-tasks 1 \
+  --num-trials 1 \
+  --run-id terminal_smoke \
+  --jobs-dir jobs \
+  --output-dir outputs/runs
+```
+
+Run the complete Terminal-Bench 2.1 task set:
+
+```bash
+python scripts/run_terminal_bench.py \
+  --dataset terminal-bench/terminal-bench-2-1 \
+  --agent terminus-2 \
+  --model openai/gpt-5.5 \
+  --all-tasks \
+  --num-trials 1 \
+  --run-id terminal_gpt55_full \
+  --jobs-dir jobs \
+  --output-dir outputs/runs
+```
+
+Useful Terminal-Bench options:
+
+- `--num-trials N` controls repeated trials per task.
+- `--max-workers N` maps to Harbor's concurrent trial count. Add it only after
+  a one-task smoke test succeeds.
+- `--task-name openssl-selfsigned-cert` runs one named task.
+- `--harbor-env daytona` selects an alternative supported sandbox provider.
+- `--run-id` fixes the output location. To retry only tasks missing a valid
+  trajectory, use `--resume-missing-from-jobs <previous-jobs-dir>`.
+
+The wrapper snapshots Harbor's `jobs/` directory, copies job artifacts under
+`outputs/runs/<run-id>/raw/`, and exports normalized trajectories plus
+`summary.json` and `manifest.json`. The Harbor job directory is separate from
+the Git repository and should not be committed.
+
 ## Configure
 
 Copy `.env.example` to `.env` and set your API key:
@@ -89,8 +392,8 @@ OUTPUT_DIR=outputs/runs
 REASONING_EFFORT=medium
 TEMPERATURE=0
 
-# Terminal-Bench 2.0 via Harbor.
-TERMINAL_BENCH_DATASET=terminal-bench/terminal-bench-2
+# Terminal-Bench 2.1 via Harbor.
+TERMINAL_BENCH_DATASET=terminal-bench/terminal-bench-2-1
 TERMINAL_BENCH_AGENT=terminus-2
 HARBOR_JOBS_DIR=jobs
 
@@ -346,7 +649,7 @@ python scripts/run_metacorebench_visualization.py \
   --execute
 ```
 
-Supported visualization benchmark labels are `tau2_airline`, `tau2_retail`, `tau2_telecom`, `hle_with_tools`, and `terminal_bench_2`. The wrapper maps existing collection labels such as `tau2-bench`, `hle-with-tools`, and `terminal-bench-2.0` when it can infer the domain from the run metadata.
+Supported visualization benchmark labels are `tau2_airline`, `tau2_retail`, `tau2_telecom`, `hle_with_tools`, and `terminal_bench_2`. The wrapper maps existing collection labels such as `tau2-bench`, `hle-with-tools`, and Terminal-Bench 2.0/2.1 labels when it can infer the domain from the run metadata.
 
 ## Collector Only
 
@@ -375,35 +678,6 @@ outputs/runs/<run_id>/
   summary.json
 ```
 
-### Terminal-Bench 2.0
-
-Terminal-Bench 2.0 is run through Harbor. Install Harbor and make sure Docker is running:
-
-```bash
-uv tool install harbor
-harbor --help
-```
-
-Dry-run:
-
-```bash
-python scripts/run_terminal_bench.py --dry-run
-```
-
-Run one task:
-
-```bash
-python scripts/run_terminal_bench.py --model openai/gpt-5.4 --agent terminus-2 --num-tasks 1 --num-trials 1
-```
-
-Run a named task:
-
-```bash
-python scripts/run_terminal_bench.py --model openai/gpt-5.4 --agent terminus-2 --task-name openssl-selfsigned-cert
-```
-
-The script snapshots Harbor's `jobs/` directory, copies new or modified job files into `raw/`, and then exports normalized and benchmark-style trajectories.
-
 ### OSWorld-Verified
 
 OSWorld-Verified requires a working OSWorld checkout plus its VM/Docker environment. Clone and install OSWorld separately:
@@ -427,55 +701,6 @@ python scripts/run_osworld_verified.py --repo-dir .external/OSWorld --provider-n
 ```
 
 OSWorld writes screenshots, actions, and recordings under its `result_dir`; this wrapper sets `result_dir` inside the run folder, copies those files into `raw/`, and exports any JSON/JSONL records it finds.
-
-### HLE W/ Tools
-
-Use the official `activeloopai/hle_with_tools` checkout through `scripts/run_hle_with_tools.py`. The wrapper calls the official runner, keeps its raw prediction/temp/code/trace files, and exports our unified `trajectory_text` format.
-
-Official tools exposed in the run are `code_interpreter`, `web_browsing`, and `scientific_search`. The wrapper defaults to the official README settings `--max_completion_tokens 40000` and `--max_iterations 15`; it filters multimodal examples by default.
-
-The official repo declares Python 3.12+ in its `pyproject.toml`. Prefer `uv run` for HLE-with-tools so the benchmark environment stays isolated from the main MetaCoreBench environment.
-
-Dry-run:
-
-```bash
-python scripts/run_hle_with_tools.py --dry-run --data-path data/modelscope/cais_hle/data/test-00000-of-00001.parquet
-```
-
-Run one example:
-
-```bash
-python scripts/run_hle_with_tools.py --data-path data/modelscope/cais_hle/data/test-00000-of-00001.parquet --model gpt-5.5 --base-url https://api.openai.com/v1 --num-tasks 1 --max-workers 2
-```
-
-Run all text-only examples with official checkpointing:
-
-```bash
-python scripts/run_hle_with_tools.py \
-  --model openai/gpt-5.5 \
-  --base-url https://evamux.alibaba-inc.com/v1 \
-  --all-tasks \
-  --max-workers 4 \
-  --max-retries 3 \
-  --process-retries 3 \
-  --run-id hle_gpt55_full \
-  --max-iterations 15 \
-  --max-completion-tokens 40000 \
-  --progress-interval 30 \
-  --output-dir /home/wm496616/MetaCoreBench_wm/outputs/runs
-```
-
-Use the same `--run-id` to continue an interrupted run. The official runner writes `raw/official_run/hle_<model>.json.temp` incrementally, plus per-question logs under `raw/official_run/traces/trace_<question_id>.log`; the wrapper converts those traces into `benchmark_trajectories.jsonl`.
-
-For unstable or rate-limited endpoints, start with `--max-workers 2`. The official runner asserts that workers must be at least 2.
-
-The wrapper prints progress by counting completed predictions in the official temp/final JSON file. Lower `--progress-interval` if you want more frequent intermediate lines.
-
-The official `scientific_search` tool needs `ACTIVELOOP_API_KEY`, `ACTIVELOOP_WORKSPACE`, and `ACTIVELOOP_BASE_URL`. Without those, tasks that call scientific search will record tool errors in the trace.
-
-The wrapper does not send `temperature` by default, because some GPT-5.5-compatible endpoints reject that parameter. Use `--temperature` or `HLE_TEMPERATURE` only with models/endpoints that accept it.
-
-The previous minimal local harness is still available as `scripts/run_hle_tools.py` for debugging simple JSON/JSONL/parquet questions, but official HLE-with-tools collection should use `scripts/run_hle_with_tools.py`.
 
 ## Common Issues
 
@@ -530,7 +755,7 @@ python scripts/run_tau2_gpt55.py --simulations-dir path/to/simulations
 
 ### `harbor` command not found
 
-Install Harbor with `uv tool install harbor`, then run `harbor --help`. Terminal-Bench 2.0 requires Docker or a supported Harbor sandbox provider.
+Install Harbor with `uv tool install harbor`, then run `harbor --help`. Terminal-Bench 2.1 requires Docker or a supported Harbor sandbox provider.
 
 ### OSWorld run script not found
 

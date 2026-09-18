@@ -78,7 +78,45 @@ def parse_json_object(text: str) -> dict[str, Any]:
         end = text.rfind("}")
         if start < 0 or end <= start:
             raise
-        value = json.loads(text[start : end + 1])
+        candidate = text[start : end + 1]
+        try:
+            value = json.loads(candidate)
+        except json.JSONDecodeError:
+            # Some judge responses contain LaTeX-style or incomplete Unicode
+            # escapes inside JSON strings. Preserve valid JSON escapes and quote
+            # only the invalid backslashes before parsing again.
+            def repair_escape(match: re.Match[str]) -> str:
+                return "\\\\" + match.group(0)[1:]
+
+            repaired = re.sub(
+                r'\\u(?![0-9a-fA-F]{4})|\\(?!["\\/bfnrtu])',
+                repair_escape,
+                candidate,
+            )
+            try:
+                value = json.loads(repaired)
+            except json.JSONDecodeError:
+                # Last-resort extraction keeps a malformed explanation from
+                # discarding an otherwise usable yes/no judgement.
+                correct_match = re.search(
+                    r'"correct"\s*:\s*"?(yes|no)"?', candidate, flags=re.IGNORECASE
+                )
+                if not correct_match:
+                    raise
+                answer_match = re.search(
+                    r'"extracted_final_answer"\s*:\s*"((?:\\.|[^"\\])*)"',
+                    candidate,
+                    flags=re.DOTALL,
+                )
+                confidence_match = re.search(
+                    r'"confidence"\s*:\s*(-?\d+(?:\.\d+)?)', candidate
+                )
+                value = {
+                    "correct": correct_match.group(1).lower(),
+                    "extracted_final_answer": answer_match.group(1) if answer_match else "None",
+                    "reasoning": "",
+                    "confidence": confidence_match.group(1) if confidence_match else 100,
+                }
     if not isinstance(value, dict):
         raise ValueError("Judge response is not a JSON object")
     return value
@@ -221,6 +259,29 @@ async def run(args: argparse.Namespace) -> None:
                     "HistoricalStuckQuestion",
                     "Question did not produce a prediction in the original run and was counted incorrect.",
                 )
+            continue
+
+        prediction = predictions[qid]
+        prediction_error = prediction.get("error") or {}
+        response = str(prediction.get("response", ""))
+        if prediction_error and not response.strip():
+            # Newer runner versions keep failed tasks in the predictions file as
+            # empty-response placeholders. These are experiment generation
+            # failures, so preserve their provenance and count them incorrect
+            # without sending an empty answer to the external judge.
+            value = dict(prediction)
+            value["judge_response"] = {
+                "correct_answer": str(question["answer"]),
+                "model_answer": "None",
+                "reasoning": str(
+                    prediction_error.get("message")
+                    or "Agent returned no prediction and was counted incorrect."
+                ),
+                "correct": "no",
+                "confidence": 100,
+                "judge_model": "fixed_incorrect",
+            }
+            judged[qid] = value
     atomic_json_dump(args.output, judged)
 
     api_key = os.getenv("OPENAI_API_KEY")
@@ -255,6 +316,33 @@ async def run(args: argparse.Namespace) -> None:
             except Exception as exc:
                 failures[qid] = str(exc)
                 print(f"[{qid}] ERROR {exc}", flush=True)
+                if not args.judge_failures_incorrect:
+                    return
+                value = dict(prediction)
+                message = f"Judge call failed and was counted incorrect: {exc}"
+                value["error"] = {"error_type": "JudgeFailure", "message": message}
+                value["judge_response"] = {
+                    "correct_answer": str(question["answer"]),
+                    "model_answer": str(prediction.get("response", "")),
+                    "reasoning": message,
+                    "correct": "no",
+                    "confidence": 100,
+                    "judge_model": "fixed_incorrect",
+                }
+                async with write_lock:
+                    judged[qid] = value
+                    completed_since_flush += 1
+                    if completed_since_flush >= args.flush_every:
+                        atomic_json_dump(args.output, judged)
+                        completed_since_flush = 0
+                    done = sum(
+                        qid in judged and "judge_response" in judged[qid]
+                        for qid in predictions
+                    )
+                    print(
+                        f"Judged {done}/{len(predictions)} answered predictions",
+                        flush=True,
+                    )
                 return
         value = dict(prediction)
         value["judge_response"] = judgement
@@ -275,9 +363,19 @@ async def run(args: argparse.Namespace) -> None:
         for qid in predictions
         if qid in dataset_by_id and "judge_response" not in judged.get(qid, {})
     ]
+    fixed_incorrect = sum(
+        value.get("judge_response", {}).get("judge_model") == "fixed_incorrect"
+        for value in judged.values()
+    )
+    cached_judged = sum(
+        qid in judged
+        and "judge_response" in judged[qid]
+        and judged[qid].get("judge_response", {}).get("judge_model") != "fixed_incorrect"
+        for qid in predictions
+    )
     print(
-        f"Dataset={len(dataset)} predictions={len(predictions)} fixed_incorrect={len(dataset)-len(predictions)} "
-        f"cached={len(predictions)-len(pending)} pending={len(pending)}",
+        f"Dataset={len(dataset)} predictions={len(predictions)} fixed_incorrect={fixed_incorrect} "
+        f"cached={cached_judged} pending={len(pending)}",
         flush=True,
     )
     await asyncio.gather(*(process(qid) for qid in pending))
@@ -285,7 +383,12 @@ async def run(args: argparse.Namespace) -> None:
     if failures:
         failure_path = args.output.with_suffix(".failures.json")
         atomic_json_dump(failure_path, failures)
-        raise RuntimeError(f"{len(failures)} judge calls failed; rerun to resume. See {failure_path}")
+        if not args.judge_failures_incorrect:
+            raise RuntimeError(f"{len(failures)} judge calls failed; rerun to resume. See {failure_path}")
+    else:
+        failure_path = args.output.with_suffix(".failures.json")
+        if failure_path.exists():
+            atomic_json_dump(failure_path, {})
     summary = build_summary(dataset, judged)
     atomic_json_dump(args.summary, summary)
     print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
@@ -305,6 +408,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--timeout", type=float, default=300.0)
     parser.add_argument("--max-completion-tokens", type=int, default=4096)
     parser.add_argument("--flush-every", type=int, default=8)
+    parser.add_argument(
+        "--judge-failures-incorrect",
+        action="store_true",
+        help="Record exhausted judge calls as incorrect instead of aborting the scoring run.",
+    )
     return parser.parse_args()
 
 

@@ -353,6 +353,18 @@ class RunHLEWithToolsOfficialTests(unittest.TestCase):
             self.assertIn("--system_prompt_file", command)
             self.assertIn(str(prompt_path.resolve()), command)
 
+    def test_cli_forwards_main_agent_extra_body_without_prompt_changes(self):
+        body = '{"vllm_xargs":{"steer":"{\\"method\\":\\"add_vector\\"}"}}'
+        args = parse_args(["--agent-extra-body-json", body])
+        env = apply_cli_overrides({}, args)
+        config = build_hle_with_tools_config(env=env, now="2026-07-16_120000")
+
+        self.assertEqual(config.agent_extra_body_json, body)
+        self.assertEqual(config.system_prompt_file, None)
+        self.assertEqual(hle_runner.config_for_manifest(config)["agent_extra_body"], json.loads(body))
+        official_env = hle_runner.prepare_official_env(config, {})
+        self.assertEqual(official_env["HLE_WITH_TOOLS_AGENT_EXTRA_BODY_JSON"], body)
+
 
 if __name__ == "__main__":
     unittest.main()

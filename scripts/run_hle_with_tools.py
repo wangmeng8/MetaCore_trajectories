@@ -22,6 +22,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from scripts.collect_trajectories import summarize_trajectories
+from scripts.hle_outcome_caa import build_identity, guard_resume, merged_agent_json, deep_merge, json_object
 from scripts.runner_common import (
     ProgressPrinter,
     build_manifest,
@@ -70,6 +71,7 @@ class HLEWithToolsConfig:
     system_prompt_file: Path | None = None
     stall_timeout_seconds: float = 2100.0
     api_timeout_seconds: float = 300.0
+    agent_extra_body_json: str | None = None
 
     @property
     def dataset_arg(self) -> str:
@@ -131,6 +133,7 @@ def build_hle_with_tools_config(env: dict[str, str] | None = None, now: str | No
         data_path=Path(data_path) if data_path else None,
         model=model,
         base_url=normalize_base_url(env.get("OPENAI_BASE_URL") or env.get("HLE_OPENAI_BASE_URL")),
+        agent_extra_body_json=merged_agent_json(env),
         num_tasks=num_tasks,
         num_rollouts=max(1, env_int(env, "HLE_NUM_ROLLOUTS", 1)),
         max_workers=max(2, env_int(env, "HLE_MAX_WORKERS", 2)),
@@ -204,6 +207,8 @@ def prepare_official_env(config: HLEWithToolsConfig, base_env: dict[str, str] | 
     env = prepare_subprocess_env(base_env)
     if config.base_url:
         env["OPENAI_BASE_URL"] = config.base_url
+    if config.agent_extra_body_json:
+        env["HLE_WITH_TOOLS_AGENT_EXTRA_BODY_JSON"] = config.agent_extra_body_json
     env["HLE_WITH_TOOLS_RUNS_DIR"] = str((config.run_dir / "raw").resolve())
     env["HLE_WITH_TOOLS_RUN_NAME"] = "official_run"
     env["HLE_WITH_TOOLS_TEXT_ONLY"] = "1" if config.text_only else "0"
@@ -704,6 +709,13 @@ def config_for_manifest(config: HLEWithToolsConfig) -> dict[str, Any]:
     payload["system_prompt_file"] = str(config.system_prompt_file) if config.system_prompt_file else None
     payload["dataset_arg"] = config.dataset_arg
     payload["tools"] = config.tool_names
+    if config.agent_extra_body_json:
+        try:
+            payload["agent_extra_body"] = json.loads(config.agent_extra_body_json)
+        except json.JSONDecodeError:
+            payload["agent_extra_body"] = "<invalid JSON>"
+    else:
+        payload["agent_extra_body"] = None
     return payload
 
 
@@ -716,6 +728,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--data-path", type=Path, help="Local HLE parquet/json/jsonl file. Overrides --dataset.")
     parser.add_argument("--model", help="Model name passed to the official runner.")
     parser.add_argument("--base-url", help="OpenAI-compatible base URL. Bare hosts get /v1 appended.")
+    parser.add_argument(
+        "--agent-extra-body-json",
+        help="JSON extra_body sent only to the main agent; auxiliary tool/judge requests stay unsteered.",
+    )
     parser.add_argument("--num-tasks", type=int, help="Number of text-only HLE examples to run.")
     parser.add_argument("--num-rollouts", type=int, help="Independent model rollouts per dataset example (default: 1).")
     parser.add_argument("--all-tasks", action="store_true", help="Run all selected examples.")
@@ -755,6 +771,7 @@ def apply_cli_overrides(env: dict[str, str], args: argparse.Namespace) -> dict[s
         "HLE_DATA_PATH": str(args.data_path) if args.data_path else None,
         "HLE_MODEL": args.model,
         "OPENAI_BASE_URL": normalize_base_url(args.base_url),
+        "HLE_WITH_TOOLS_AGENT_EXTRA_BODY_JSON": args.agent_extra_body_json,
         "NUM_TASKS": args.num_tasks,
         "HLE_NUM_ROLLOUTS": args.num_rollouts,
         "HLE_MAX_WORKERS": args.max_workers,
@@ -774,7 +791,10 @@ def apply_cli_overrides(env: dict[str, str], args: argparse.Namespace) -> dict[s
     }
     for key, value in updates.items():
         if value is not None:
-            env[key] = str(value)
+            if key == "HLE_WITH_TOOLS_AGENT_EXTRA_BODY_JSON" and env.get(key):
+                env[key] = json.dumps(deep_merge(json_object(env[key]), json_object(value)))
+            else:
+                env[key] = str(value)
     if args.all_tasks:
         env["HLE_ALL_TASKS"] = "1"
     if args.include_multimodal:
@@ -799,6 +819,13 @@ def validate_real_run(config: HLEWithToolsConfig, env: dict[str, str]) -> str | 
         return f"HLE_DATA_PATH does not exist: {config.data_path}"
     if config.system_prompt_file is not None and not config.system_prompt_file.is_file():
         return f"HLE_SYSTEM_PROMPT_FILE does not exist or is not a file: {config.system_prompt_file}"
+    if config.agent_extra_body_json:
+        try:
+            parsed = json.loads(config.agent_extra_body_json)
+        except json.JSONDecodeError as exc:
+            return f"HLE_WITH_TOOLS_AGENT_EXTRA_BODY_JSON is not valid JSON: {exc}"
+        if not isinstance(parsed, dict):
+            return "HLE_WITH_TOOLS_AGENT_EXTRA_BODY_JSON must decode to a JSON object"
     return None
 
 
@@ -809,6 +836,18 @@ def main(argv: list[str] | None = None) -> int:
     config = build_hle_with_tools_config(env=env)
     command = build_official_command(config)
     official_env = prepare_official_env(config, env)
+
+    # Validate and compare BEFORE copying prompts or overwriting any manifest.
+    try:
+        identity = build_identity(config, env)
+        guard_resume(config.run_dir, identity)
+        if identity is not None:
+            helper = config.repo_dir / "hle_eval/agent/extra_body.py"
+            if not helper.is_file():
+                raise ValueError("Apply scripts/prepare_hle_outcome_caa.sh before using steering")
+    except (ValueError, OSError, KeyError, TypeError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
 
     config.run_dir.mkdir(parents=True, exist_ok=True)
     if config.system_prompt_file and config.system_prompt_file.is_file():
@@ -823,6 +862,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     manifest["official_repo"] = "activeloopai/hle_with_tools"
     manifest["official_cwd"] = str(config.repo_dir)
+    if identity is not None:
+        manifest["outcome_caa"] = identity
     write_json(config.run_dir / "manifest.json", manifest)
 
     if args.dry_run:
