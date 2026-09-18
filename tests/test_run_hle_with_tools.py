@@ -1,7 +1,12 @@
 import json
+import os
+import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
+
+import scripts.run_hle_with_tools as hle_runner
 
 from scripts.run_hle_with_tools import (
     HLEWithToolsConfig,
@@ -155,6 +160,104 @@ class RunHLEWithToolsOfficialTests(unittest.TestCase):
 
             self.assertEqual(current_prediction_count(config), 7)
 
+    def test_terminal_progress_includes_failures_timeouts_and_skips(self):
+        self.assertTrue(hasattr(hle_runner, "terminal_progress_count"))
+        self.assertEqual(
+            hle_runner.terminal_progress_count(
+                {
+                    "completed": 492,
+                    "failed": 2,
+                    "timed_out": 3,
+                    "skipped": 3,
+                }
+            ),
+            500,
+        )
+
+    def test_stalled_official_process_is_terminated_for_retry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = build_hle_with_tools_config(
+                env={
+                    "OUTPUT_DIR": tmp,
+                    "HLE_RUN_ID": "watchdog-test",
+                    "HLE_WITH_TOOLS_REPO_DIR": tmp,
+                    "HLE_PROGRESS_INTERVAL": "0.01",
+                    "HLE_STALL_TIMEOUT_SECONDS": "0.05",
+                },
+                now="2026-07-16_120000",
+            )
+            self.assertTrue(hasattr(config, "stall_timeout_seconds"))
+
+            started = time.monotonic()
+            returncode = hle_runner.run_official_command(
+                [sys.executable, "-c", "import time; time.sleep(10)"],
+                config=config,
+                env=dict(os.environ),
+            )
+            elapsed = time.monotonic() - started
+
+            self.assertEqual(returncode, hle_runner.WATCHDOG_EXIT_CODE)
+            self.assertLess(elapsed, 3.0)
+
+    def test_watchdog_terminates_official_child_processes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            marker = Path(tmp) / "orphan-child.txt"
+            parent_ready = Path(tmp) / "parent-ready.txt"
+            child_code = (
+                "import time; from pathlib import Path; "
+                f"time.sleep(1.0); Path({str(marker)!r}).write_text('orphan', encoding='utf-8')"
+            )
+            parent_code = (
+                "import subprocess, sys, time; from pathlib import Path; "
+                f"subprocess.Popen([sys.executable, '-c', {child_code!r}]); "
+                f"Path({str(parent_ready)!r}).write_text('ready', encoding='utf-8'); "
+                "time.sleep(10)"
+            )
+            config = build_hle_with_tools_config(
+                env={
+                    "OUTPUT_DIR": tmp,
+                    "HLE_RUN_ID": "process-tree-test",
+                    "HLE_WITH_TOOLS_REPO_DIR": tmp,
+                    "HLE_STALL_TIMEOUT_SECONDS": "0.3",
+                },
+                now="2026-07-16_120000",
+            )
+
+            returncode = hle_runner.run_official_command(
+                [sys.executable, "-c", parent_code],
+                config=config,
+                env=dict(os.environ),
+            )
+            time.sleep(1.2)
+
+            self.assertEqual(returncode, hle_runner.WATCHDOG_EXIT_CODE)
+            self.assertTrue(parent_ready.exists(), "test parent did not start its child")
+            self.assertFalse(marker.exists(), "watchdog left an orphan child process running")
+
+    def test_official_logs_are_appended_across_retries(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = build_hle_with_tools_config(
+                env={
+                    "OUTPUT_DIR": tmp,
+                    "HLE_RUN_ID": "append-log-test",
+                    "HLE_WITH_TOOLS_REPO_DIR": tmp,
+                    "HLE_STALL_TIMEOUT_SECONDS": "10",
+                },
+                now="2026-07-16_120000",
+            )
+
+            for marker in ("first-attempt", "second-attempt"):
+                returncode = hle_runner.run_official_command(
+                    [sys.executable, "-c", f"print({marker!r})"],
+                    config=config,
+                    env=dict(os.environ),
+                )
+                self.assertEqual(returncode, 0)
+
+            output = (config.run_dir / "hle_with_tools.stdout.log").read_text(encoding="utf-8")
+            self.assertIn("first-attempt", output)
+            self.assertIn("second-attempt", output)
+
     def test_can_forward_skip_failed_on_resume(self):
         config = build_hle_with_tools_config(
             env={"OUTPUT_DIR": "outputs/runs", "HLE_SKIP_FAILED_ON_RESUME": "1"},
@@ -249,6 +352,18 @@ class RunHLEWithToolsOfficialTests(unittest.TestCase):
             self.assertEqual(config.system_prompt_file, prompt_path)
             self.assertIn("--system_prompt_file", command)
             self.assertIn(str(prompt_path.resolve()), command)
+
+    def test_cli_forwards_main_agent_extra_body_without_prompt_changes(self):
+        body = '{"vllm_xargs":{"steer":"{\\"method\\":\\"add_vector\\"}"}}'
+        args = parse_args(["--agent-extra-body-json", body])
+        env = apply_cli_overrides({}, args)
+        config = build_hle_with_tools_config(env=env, now="2026-07-16_120000")
+
+        self.assertEqual(config.agent_extra_body_json, body)
+        self.assertEqual(config.system_prompt_file, None)
+        self.assertEqual(hle_runner.config_for_manifest(config)["agent_extra_body"], json.loads(body))
+        official_env = hle_runner.prepare_official_env(config, {})
+        self.assertEqual(official_env["HLE_WITH_TOOLS_AGENT_EXTRA_BODY_JSON"], body)
 
 
 if __name__ == "__main__":

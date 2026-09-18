@@ -1,0 +1,108 @@
+warning: in the working copy of 'hle_eval/agent/config.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'hle_eval/agent/naive.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'hle_eval/agent/tools.py', LF will be replaced by CRLF the next time Git touches it
+diff --git a/hle_eval/agent/config.py b/hle_eval/agent/config.py
+index 024ef0b53a5329efb3917fd73928a6fdb8159ee6..b4fbee16a1835dbf17da7039c90ea308ad52684c 100644
+--- a/hle_eval/agent/config.py
++++ b/hle_eval/agent/config.py
+@@ -64,6 +64,12 @@ elif _env_bool("HLE_WITH_TOOLS_DISABLE_EXTRA_BODY", False) or os.getenv("OPENAI_
+ else:
+     EXTRA_BODY = _OPENROUTER_EXTRA_BODY
+ 
++from .extra_body import request_bodies
++AGENT_EXTRA_BODY, AUXILIARY_EXTRA_BODY = request_bodies(os.environ, EXTRA_BODY)
++# Legacy/auxiliary imports stay unsteered. The three agent call sites explicitly
++# use AGENT_EXTRA_BODY, including the tool loop and forced final-answer request.
++EXTRA_BODY = AUXILIARY_EXTRA_BODY
++
+ TOOL_SELECTION_GUIDE = """TOOL SELECTION GUIDANCE:
+ 
+ Tool Decision Tree:
+diff --git a/hle_eval/agent/extra_body.py b/hle_eval/agent/extra_body.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..129783429e1405c611202f5aec78224444972bd9
+--- /dev/null
++++ b/hle_eval/agent/extra_body.py
+@@ -0,0 +1,29 @@
++"""Separate main-agent and auxiliary API bodies without changing Vanilla fields."""
++from copy import deepcopy
++import json
++
++
++def merge(base, overlay):
++    out = deepcopy(base)
++    for k, v in overlay.items():
++        out[k] = merge(out[k], v) if isinstance(out.get(k), dict) and isinstance(v, dict) else deepcopy(v)
++    return out
++
++
++def request_bodies(env, default):
++    def read(name):
++        value = json.loads(env[name]) if env.get(name) else {}
++        if not isinstance(value, dict):
++            raise ValueError(f"{name} must be a JSON object")
++        return value
++    base = read("HLE_WITH_TOOLS_EXTRA_BODY_JSON") if env.get("HLE_WITH_TOOLS_EXTRA_BODY_JSON") else deepcopy(default)
++    main = merge(base, read("HLE_WITH_TOOLS_AGENT_EXTRA_BODY_JSON"))
++    aux = deepcopy(base)
++    if isinstance(aux.get("vllm_xargs"), dict):
++        aux["vllm_xargs"].pop("steer", None)
++        if not aux["vllm_xargs"]:
++            aux.pop("vllm_xargs")
++    aux = merge(aux, read("HLE_WITH_TOOLS_AUXILIARY_EXTRA_BODY_JSON"))
++    if isinstance(aux.get("vllm_xargs"), dict) and "steer" in aux["vllm_xargs"]:
++        raise ValueError("Auxiliary requests cannot contain steering")
++    return main, aux
+diff --git a/hle_eval/agent/naive.py b/hle_eval/agent/naive.py
+index 0d87fb587e3271f04cf3f4c7849502804673727e..af15cd2e45011520fd06219f7d5936d8582ba2bc 100644
+--- a/hle_eval/agent/naive.py
++++ b/hle_eval/agent/naive.py
+@@ -2,7 +2,7 @@ import json
+ import base64
+ import io
+ from PIL import Image
+-from .config import SYSTEM_EXACT_ANSWER, SYSTEM_MC, EXTRA_BODY, client
++from .config import SYSTEM_EXACT_ANSWER, SYSTEM_MC, AGENT_EXTRA_BODY, client
+ 
+ 
+ def convert_gif_to_jpeg(image_data_url: str) -> str:
+@@ -122,7 +122,7 @@ async def attempt_question(question, args):
+             max_completion_tokens=args.max_completion_tokens,
+             messages=messages,
+             stream=False,
+-            extra_body=EXTRA_BODY
++            extra_body=AGENT_EXTRA_BODY
+         )
+         content = response.choices[0].message.content
+         tokens = json.loads(response.usage.json())
+diff --git a/hle_eval/agent/tools.py b/hle_eval/agent/tools.py
+index 0df1e9e8e283509676eb2a92467b658646c5a312..a8632a8096c8dfb48b8b85bf46da4dae4a91652f 100644
+--- a/hle_eval/agent/tools.py
++++ b/hle_eval/agent/tools.py
+@@ -19,7 +19,7 @@ from ddgs.engines import ENGINES
+ from ddgs.engines.bing import Bing
+ from contextlib import redirect_stdout, redirect_stderr
+ from typing import Tuple
+-from hle_eval.agent.config import EXTRA_BODY, client, AL_WORKSPACE, ACTIVELOOP_BASE_URL, ACTIVELOOP_HEADERS, TOOLS
++from hle_eval.agent.config import AGENT_EXTRA_BODY, client, AL_WORKSPACE, ACTIVELOOP_BASE_URL, ACTIVELOOP_HEADERS, TOOLS
+ from hle_eval.agent.naive import format_message
+ from hle_eval.agent.utils import (
+     trace_tool_call,
+@@ -1472,7 +1472,7 @@ async def make_final_answer_call(messages, args, max_iterations: int, question_i
+             # Omit tools/tool_choice entirely: some OpenAI-compatible APIs
+             # reject an explicit empty tools array during the final call.
+             stream=False,
+-            extra_body=EXTRA_BODY
++            extra_body=AGENT_EXTRA_BODY
+         )
+         
+         final_message = final_response.choices[0].message
+@@ -1616,7 +1616,7 @@ async def attempt_question(question, args, max_iterations: int = 15):
+                 "max_completion_tokens": args.max_completion_tokens,
+                 "messages": messages,
+                 "stream": False,
+-                "extra_body": EXTRA_BODY,
++                "extra_body": AGENT_EXTRA_BODY,
+             }
+             if tools_available:
+                 request_kwargs["tools"] = tools_available

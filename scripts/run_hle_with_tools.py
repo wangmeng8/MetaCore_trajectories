@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import re
+import signal
 import shutil
 import subprocess
 import sys
@@ -21,6 +22,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from scripts.collect_trajectories import summarize_trajectories
+from scripts.hle_outcome_caa import build_identity, guard_resume, merged_agent_json, deep_merge, json_object
 from scripts.runner_common import (
     ProgressPrinter,
     build_manifest,
@@ -38,6 +40,7 @@ from scripts.runner_common import (
 
 BENCHMARK = "hle-with-tools"
 TOOL_NAMES = ["code_interpreter", "web_browsing", "scientific_search"]
+WATCHDOG_EXIT_CODE = 124
 
 
 @dataclass
@@ -66,6 +69,9 @@ class HLEWithToolsConfig:
     skip_failed_on_resume: bool = False
     mark_incorrect_ids: tuple[str, ...] = ()
     system_prompt_file: Path | None = None
+    stall_timeout_seconds: float = 2100.0
+    api_timeout_seconds: float = 300.0
+    agent_extra_body_json: str | None = None
 
     @property
     def dataset_arg(self) -> str:
@@ -112,6 +118,11 @@ def build_hle_with_tools_config(env: dict[str, str] | None = None, now: str | No
     all_tasks = env_bool(env, "HLE_ALL_TASKS", False)
     num_tasks = None if all_tasks else env_int(env, "NUM_TASKS", env_int(env, "HLE_NUM_EXAMPLES", 1))
     temperature = optional_float(env.get("HLE_TEMPERATURE"))
+    question_timeout_seconds = max(
+        0.0,
+        float(env.get("HLE_QUESTION_TIMEOUT_SECONDS", "1800")),
+    )
+    default_stall_timeout = max(1200.0, question_timeout_seconds + 300.0)
 
     return HLEWithToolsConfig(
         run_id=run_id,
@@ -122,6 +133,7 @@ def build_hle_with_tools_config(env: dict[str, str] | None = None, now: str | No
         data_path=Path(data_path) if data_path else None,
         model=model,
         base_url=normalize_base_url(env.get("OPENAI_BASE_URL") or env.get("HLE_OPENAI_BASE_URL")),
+        agent_extra_body_json=merged_agent_json(env),
         num_tasks=num_tasks,
         num_rollouts=max(1, env_int(env, "HLE_NUM_ROLLOUTS", 1)),
         max_workers=max(2, env_int(env, "HLE_MAX_WORKERS", 2)),
@@ -134,7 +146,7 @@ def build_hle_with_tools_config(env: dict[str, str] | None = None, now: str | No
         disable_scientific_search=env_bool(env, "HLE_DISABLE_SCIENTIFIC_SEARCH", False),
         use_uv=env_bool(env, "HLE_WITH_TOOLS_USE_UV", True),
         progress_interval=float(env.get("HLE_PROGRESS_INTERVAL", "30")),
-        question_timeout_seconds=max(0.0, float(env.get("HLE_QUESTION_TIMEOUT_SECONDS", "1800"))),
+        question_timeout_seconds=question_timeout_seconds,
         skip_failed_on_resume=env_bool(env, "HLE_SKIP_FAILED_ON_RESUME", False),
         mark_incorrect_ids=tuple(
             value.strip()
@@ -142,6 +154,14 @@ def build_hle_with_tools_config(env: dict[str, str] | None = None, now: str | No
             if value.strip()
         ),
         system_prompt_file=Path(system_prompt_file) if system_prompt_file else None,
+        stall_timeout_seconds=max(
+            0.0,
+            float(env.get("HLE_STALL_TIMEOUT_SECONDS", str(default_stall_timeout))),
+        ),
+        api_timeout_seconds=max(
+            1.0,
+            float(env.get("HLE_API_TIMEOUT_SECONDS", "300")),
+        ),
     )
 
 
@@ -187,11 +207,14 @@ def prepare_official_env(config: HLEWithToolsConfig, base_env: dict[str, str] | 
     env = prepare_subprocess_env(base_env)
     if config.base_url:
         env["OPENAI_BASE_URL"] = config.base_url
+    if config.agent_extra_body_json:
+        env["HLE_WITH_TOOLS_AGENT_EXTRA_BODY_JSON"] = config.agent_extra_body_json
     env["HLE_WITH_TOOLS_RUNS_DIR"] = str((config.run_dir / "raw").resolve())
     env["HLE_WITH_TOOLS_RUN_NAME"] = "official_run"
     env["HLE_WITH_TOOLS_TEXT_ONLY"] = "1" if config.text_only else "0"
     env["HLE_MAX_RETRIES"] = str(config.max_retries)
     env["OPENAI_MAX_RETRIES"] = str(config.max_retries)
+    env["HLE_API_TIMEOUT_SECONDS"] = str(config.api_timeout_seconds)
     env["ENABLE_TRACING"] = "true"
     env["ENABLE_CONSOLE_TRACING"] = "false"
     if config.temperature is None:
@@ -217,7 +240,17 @@ def run_official_command(
         interval_seconds=config.progress_interval,
     )
 
-    with stdout_path.open("w", encoding="utf-8") as stdout_file, stderr_path.open("w", encoding="utf-8") as stderr_file:
+    with stdout_path.open("a", encoding="utf-8") as stdout_file, stderr_path.open("a", encoding="utf-8") as stderr_file:
+        started_label = time.strftime("%Y-%m-%d %H:%M:%S")
+        stdout_file.write(f"\n===== official process started {started_label} =====\n")
+        stderr_file.write(f"\n===== official process started {started_label} =====\n")
+        stdout_file.flush()
+        stderr_file.flush()
+        popen_kwargs: dict[str, Any] = {}
+        if os.name == "nt":
+            popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            popen_kwargs["start_new_session"] = True
         process = subprocess.Popen(
             command,
             cwd=config.repo_dir,
@@ -227,16 +260,106 @@ def run_official_command(
             text=True,
             encoding="utf-8",
             errors="replace",
+            **popen_kwargs,
         )
         snapshot = current_progress_state(config)
-        progress.update(snapshot["completed"], extra=format_progress_extra(config, snapshot), force=True)
-        while process.poll() is None:
-            time.sleep(1)
+        terminal_count = terminal_progress_count(snapshot)
+        last_terminal_count = terminal_count
+        last_progress_at = time.monotonic()
+
+        def report_progress(*, force: bool = False) -> None:
+            nonlocal snapshot
             snapshot = current_progress_state(config)
-            progress.update(snapshot["completed"], extra=format_progress_extra(config, snapshot))
-        snapshot = current_progress_state(config)
-        progress.update(snapshot["completed"], extra=format_progress_extra(config, snapshot), force=True)
-        return int(process.returncode or 0)
+            if snapshot["total"]:
+                progress.total = snapshot["total"]
+            progress.update(
+                terminal_progress_count(snapshot),
+                extra=format_progress_extra(config, snapshot),
+                force=force,
+            )
+
+        report_progress(force=True)
+        poll_interval = min(
+            1.0,
+            max(0.05, config.stall_timeout_seconds / 4.0),
+        )
+        try:
+            while process.poll() is None:
+                time.sleep(poll_interval)
+                snapshot = current_progress_state(config)
+                terminal_count = terminal_progress_count(snapshot)
+                if terminal_count != last_terminal_count:
+                    last_terminal_count = terminal_count
+                    last_progress_at = time.monotonic()
+                report_progress()
+                stalled_for = time.monotonic() - last_progress_at
+                if (
+                    config.stall_timeout_seconds > 0
+                    and stalled_for >= config.stall_timeout_seconds
+                ):
+                    message = (
+                        f"Watchdog: no terminal question progress for {stalled_for:.1f}s; "
+                        f"terminating official process group PID {process.pid}."
+                    )
+                    print(message, file=sys.stderr, flush=True)
+                    stderr_file.write(message + "\n")
+                    stderr_file.flush()
+                    terminate_process_group(process)
+                    report_progress(force=True)
+                    return WATCHDOG_EXIT_CODE
+            report_progress(force=True)
+            return int(process.returncode or 0)
+        finally:
+            if process.poll() is None:
+                terminate_process_group(process)
+
+
+def terminate_process_group(process: subprocess.Popen[Any], grace_seconds: float = 10.0) -> None:
+    if process.poll() is not None:
+        return
+    if os.name != "nt":
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except (OSError, ProcessLookupError):
+            return
+    else:
+        try:
+            import psutil
+
+            parent = psutil.Process(process.pid)
+            descendants = parent.children(recursive=True)
+            for descendant in descendants:
+                descendant.terminate()
+            parent.terminate()
+            _, alive = psutil.wait_procs([*descendants, parent], timeout=grace_seconds)
+            for remaining in alive:
+                remaining.kill()
+            psutil.wait_procs(alive, timeout=grace_seconds)
+        except (ImportError, OSError):
+            taskkill = subprocess.run(
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+            if taskkill.returncode != 0 and process.poll() is None:
+                process.terminate()
+    try:
+        process.wait(timeout=grace_seconds)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    if os.name != "nt":
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except (OSError, ProcessLookupError):
+            return
+    else:
+        process.kill()
+    try:
+        process.wait(timeout=grace_seconds)
+    except subprocess.TimeoutExpired:
+        pass
 
 
 def collect_hle_with_tools_outputs(config: HLEWithToolsConfig) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
@@ -430,6 +553,13 @@ def current_prediction_count(config: HLEWithToolsConfig) -> int:
     return current_progress_state(config)["completed"]
 
 
+def terminal_progress_count(snapshot: dict[str, int]) -> int:
+    return sum(
+        max(0, int(snapshot.get(key, 0)))
+        for key in ("completed", "failed", "timed_out", "skipped")
+    )
+
+
 def current_progress_state(config: HLEWithToolsConfig) -> dict[str, int]:
     defaults = {
         "completed": 0,
@@ -453,7 +583,7 @@ def current_progress_state(config: HLEWithToolsConfig) -> dict[str, int]:
 
 
 def format_progress_extra(config: HLEWithToolsConfig, snapshot: dict[str, int]) -> str:
-    details = [f"workers={config.max_workers}"]
+    details = [f"workers={config.max_workers}", f"successful={snapshot['completed']}"]
     if snapshot["total"]:
         details.append(f"total={snapshot['total']}")
     for key in ("running", "failed", "timed_out", "skipped", "pending"):
@@ -579,6 +709,13 @@ def config_for_manifest(config: HLEWithToolsConfig) -> dict[str, Any]:
     payload["system_prompt_file"] = str(config.system_prompt_file) if config.system_prompt_file else None
     payload["dataset_arg"] = config.dataset_arg
     payload["tools"] = config.tool_names
+    if config.agent_extra_body_json:
+        try:
+            payload["agent_extra_body"] = json.loads(config.agent_extra_body_json)
+        except json.JSONDecodeError:
+            payload["agent_extra_body"] = "<invalid JSON>"
+    else:
+        payload["agent_extra_body"] = None
     return payload
 
 
@@ -591,6 +728,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--data-path", type=Path, help="Local HLE parquet/json/jsonl file. Overrides --dataset.")
     parser.add_argument("--model", help="Model name passed to the official runner.")
     parser.add_argument("--base-url", help="OpenAI-compatible base URL. Bare hosts get /v1 appended.")
+    parser.add_argument(
+        "--agent-extra-body-json",
+        help="JSON extra_body sent only to the main agent; auxiliary tool/judge requests stay unsteered.",
+    )
     parser.add_argument("--num-tasks", type=int, help="Number of text-only HLE examples to run.")
     parser.add_argument("--num-rollouts", type=int, help="Independent model rollouts per dataset example (default: 1).")
     parser.add_argument("--all-tasks", action="store_true", help="Run all selected examples.")
@@ -606,6 +747,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, help="Base output directory.")
     parser.add_argument("--progress-interval", type=float, help="Seconds between progress updates.")
     parser.add_argument("--question-timeout-seconds", type=float, help="Hard wall-clock limit for one full question trajectory.")
+    parser.add_argument("--stall-timeout-seconds", type=float, help="Restart the official process after this many seconds without a terminal question result (0 disables).")
+    parser.add_argument("--api-timeout-seconds", type=float, help="Timeout for one OpenAI-compatible API request.")
     parser.add_argument("--skip-failed-on-resume", action="store_true", help="Skip IDs already recorded as failed or timed out.")
     parser.add_argument(
         "--mark-incorrect-ids",
@@ -628,6 +771,7 @@ def apply_cli_overrides(env: dict[str, str], args: argparse.Namespace) -> dict[s
         "HLE_DATA_PATH": str(args.data_path) if args.data_path else None,
         "HLE_MODEL": args.model,
         "OPENAI_BASE_URL": normalize_base_url(args.base_url),
+        "HLE_WITH_TOOLS_AGENT_EXTRA_BODY_JSON": args.agent_extra_body_json,
         "NUM_TASKS": args.num_tasks,
         "HLE_NUM_ROLLOUTS": args.num_rollouts,
         "HLE_MAX_WORKERS": args.max_workers,
@@ -640,12 +784,17 @@ def apply_cli_overrides(env: dict[str, str], args: argparse.Namespace) -> dict[s
         "OUTPUT_DIR": str(args.output_dir) if args.output_dir else None,
         "HLE_PROGRESS_INTERVAL": args.progress_interval,
         "HLE_QUESTION_TIMEOUT_SECONDS": args.question_timeout_seconds,
+        "HLE_STALL_TIMEOUT_SECONDS": args.stall_timeout_seconds,
+        "HLE_API_TIMEOUT_SECONDS": args.api_timeout_seconds,
         "HLE_MARK_INCORRECT_IDS": args.mark_incorrect_ids,
         "HLE_SYSTEM_PROMPT_FILE": str(args.system_prompt_file) if args.system_prompt_file else None,
     }
     for key, value in updates.items():
         if value is not None:
-            env[key] = str(value)
+            if key == "HLE_WITH_TOOLS_AGENT_EXTRA_BODY_JSON" and env.get(key):
+                env[key] = json.dumps(deep_merge(json_object(env[key]), json_object(value)))
+            else:
+                env[key] = str(value)
     if args.all_tasks:
         env["HLE_ALL_TASKS"] = "1"
     if args.include_multimodal:
@@ -670,6 +819,13 @@ def validate_real_run(config: HLEWithToolsConfig, env: dict[str, str]) -> str | 
         return f"HLE_DATA_PATH does not exist: {config.data_path}"
     if config.system_prompt_file is not None and not config.system_prompt_file.is_file():
         return f"HLE_SYSTEM_PROMPT_FILE does not exist or is not a file: {config.system_prompt_file}"
+    if config.agent_extra_body_json:
+        try:
+            parsed = json.loads(config.agent_extra_body_json)
+        except json.JSONDecodeError as exc:
+            return f"HLE_WITH_TOOLS_AGENT_EXTRA_BODY_JSON is not valid JSON: {exc}"
+        if not isinstance(parsed, dict):
+            return "HLE_WITH_TOOLS_AGENT_EXTRA_BODY_JSON must decode to a JSON object"
     return None
 
 
@@ -680,6 +836,18 @@ def main(argv: list[str] | None = None) -> int:
     config = build_hle_with_tools_config(env=env)
     command = build_official_command(config)
     official_env = prepare_official_env(config, env)
+
+    # Validate and compare BEFORE copying prompts or overwriting any manifest.
+    try:
+        identity = build_identity(config, env)
+        guard_resume(config.run_dir, identity)
+        if identity is not None:
+            helper = config.repo_dir / "hle_eval/agent/extra_body.py"
+            if not helper.is_file():
+                raise ValueError("Apply scripts/prepare_hle_outcome_caa.sh before using steering")
+    except (ValueError, OSError, KeyError, TypeError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
 
     config.run_dir.mkdir(parents=True, exist_ok=True)
     if config.system_prompt_file and config.system_prompt_file.is_file():
@@ -694,6 +862,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     manifest["official_repo"] = "activeloopai/hle_with_tools"
     manifest["official_cwd"] = str(config.repo_dir)
+    if identity is not None:
+        manifest["outcome_caa"] = identity
     write_json(config.run_dir / "manifest.json", manifest)
 
     if args.dry_run:

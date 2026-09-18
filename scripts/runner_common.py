@@ -116,7 +116,11 @@ def snapshot_files(root: Path) -> dict[str, tuple[int, int]]:
     snapshot: dict[str, tuple[int, int]] = {}
     for path in root.rglob("*"):
         if path.is_file():
-            stat = path.stat()
+            try:
+                stat = path.stat()
+            except OSError:
+                # Harbor can remove a temporary file between discovery and stat.
+                continue
             snapshot[str(path.relative_to(root))] = (stat.st_mtime_ns, stat.st_size)
     return snapshot
 
